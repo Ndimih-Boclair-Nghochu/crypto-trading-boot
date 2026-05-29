@@ -61,6 +61,32 @@ class Journal:
             },
         )
 
+    async def log_partial_exit(
+        self,
+        symbol: str,
+        exit_price: Decimal | float | str,
+        quantity_closed: Decimal | float | str,
+        pnl_usd: Decimal | float | str,
+        r_multiple: Decimal | float | str,
+        reason: str = "TP1",
+    ) -> None:
+        await self._put(
+            "system_event",
+            {
+                "event_type": f"PARTIAL_EXIT_{reason}",
+                "severity": "INFO",
+                "message": f"{symbol} partial exit at {exit_price}",
+                "context": {
+                    "symbol": symbol,
+                    "exit_price": str(exit_price),
+                    "quantity_closed": str(quantity_closed),
+                    "pnl_usd": str(pnl_usd),
+                    "r_multiple": str(r_multiple),
+                    "reason": reason,
+                },
+            },
+        )
+
     async def log_no_trade(self, signal: TradeSignal, gate_failed: str) -> None:
         await self._put("no_trade", {"signal": signal, "gate_failed": gate_failed, "logged_at": datetime.now(UTC)})
 

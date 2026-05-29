@@ -98,3 +98,30 @@ def test_max_concurrent_trades_blocks_trade() -> None:
     )
     assert not second.approved
     assert second.reason == "max concurrent open trades exceeded"
+
+
+def test_register_closed_trade_updates_kelly_correctly() -> None:
+    no_history = RiskManager(Settings())
+    no_history_plan = run(
+        no_history.calculate(
+            TradeCandidate(signal=signal(), entry_price=100, atr=2, account_balance=10_000, available_balance=10_000)
+        )
+    )
+
+    manager = RiskManager(Settings())
+    for idx in range(8):
+        manager.register_closed_trade(f"WIN{idx}", Decimal("100"), Decimal("2"))
+    for idx in range(7):
+        manager.register_closed_trade(f"LOSS{idx}", Decimal("-70"), Decimal("-1"))
+
+    half_kelly = manager._half_kelly_fraction()
+    assert half_kelly is not None
+    assert half_kelly > 0
+
+    adjusted_plan = run(
+        manager.calculate(
+            TradeCandidate(signal=signal(), entry_price=100, atr=2, account_balance=10_000, available_balance=10_000)
+        )
+    )
+    assert adjusted_plan.approved
+    assert adjusted_plan.quantity < no_history_plan.quantity

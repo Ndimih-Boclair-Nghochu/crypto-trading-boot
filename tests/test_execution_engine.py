@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
+from types import SimpleNamespace
 
-from trading.execution_engine import ExecutionEngine
+from trading.execution_engine import ExecutionEngine, ManagedTrade
 from trading.risk_manager import RiskManager, TradePlan
 from utils.binance_client import OrderResult
 
@@ -12,6 +13,8 @@ class FakeClient:
     def __init__(self) -> None:
         self.orders: list[dict] = []
         self.cancelled: list[str] = []
+        self.current_price = Decimal("100")
+        self.open_orders: list[dict] = []
 
     async def get_usdt_balance(self) -> Decimal:
         return Decimal("10000")
@@ -32,7 +35,37 @@ class FakeClient:
         return True
 
     async def get_open_orders(self, symbol=None):
-        return []
+        if symbol:
+            return [order for order in self.open_orders if order.get("symbol") == symbol]
+        return self.open_orders
+
+    async def get_ohlcv(self, symbol: str, interval: str, limit: int = 1):
+        return [SimpleNamespace(close=self.current_price)]
+
+
+class FakeJournal:
+    def __init__(self) -> None:
+        self.exits = []
+        self.events = []
+        self.partials = []
+
+    async def log_trade_exit(self, symbol, exit_price, exit_reason):
+        self.exits.append({"symbol": symbol, "exit_price": exit_price, "exit_reason": exit_reason})
+
+    async def log_event(self, event_type, severity, message, context=None):
+        self.events.append({"event_type": event_type, "severity": severity, "message": message, "context": context or {}})
+
+    async def log_partial_exit(self, symbol, exit_price, quantity_closed, pnl_usd, r_multiple, reason="TP1"):
+        self.partials.append(
+            {
+                "symbol": symbol,
+                "exit_price": exit_price,
+                "quantity_closed": quantity_closed,
+                "pnl_usd": pnl_usd,
+                "r_multiple": r_multiple,
+                "reason": reason,
+            }
+        )
 
 
 def plan() -> TradePlan:
@@ -96,3 +129,41 @@ def test_emergency_close_closes_managed_trade() -> None:
     assert "BTCUSDT" not in engine.open_trades
     if engine._monitor_task:
         engine._monitor_task.cancel()
+
+
+def test_sl_hit_cleans_up_local_state() -> None:
+    fake = FakeClient()
+    fake.current_price = Decimal("96")
+    risk = RiskManager()
+    trade_plan = plan()
+    risk.register_open_position(trade_plan)
+    journal = FakeJournal()
+    engine = ExecutionEngine(fake, risk, journal)  # type: ignore[arg-type]
+    engine.open_trades["BTCUSDT"] = ManagedTrade(trade_plan, "entry-1", remaining_quantity=trade_plan.quantity)
+
+    run(engine._monitor_once())
+
+    assert "BTCUSDT" not in engine.open_trades
+    assert "BTCUSDT" not in risk.open_positions
+    assert risk.closed_trades[-1].pnl_usd < 0
+    assert risk.closed_trades[-1].r_multiple < 0
+    assert journal.exits[-1]["exit_reason"] == "SL"
+
+
+def test_reconcile_cleans_stale_ghost_position() -> None:
+    fake = FakeClient()
+    fake.current_price = Decimal("96")
+    fake.open_orders = []
+    risk = RiskManager()
+    trade_plan = plan()
+    risk.register_open_position(trade_plan)
+    journal = FakeJournal()
+    engine = ExecutionEngine(fake, risk, journal)  # type: ignore[arg-type]
+    engine.open_trades["BTCUSDT"] = ManagedTrade(trade_plan, "entry-1", remaining_quantity=trade_plan.quantity)
+
+    run(engine.reconcile_orders())
+
+    assert "BTCUSDT" not in engine.open_trades
+    assert "BTCUSDT" not in risk.open_positions
+    assert journal.exits[-1]["exit_reason"] == "SL"
+    assert journal.events[-1]["event_type"] == "RECONCILE_CLOSE"

@@ -168,17 +168,38 @@ class ExecutionEngine:
                     managed.trailing_stop = self.risk_manager.update_trailing_stop(symbol, price, atr_value)
 
                 if not managed.tp1_hit and self._target_hit(plan.direction or "", price, plan.tp1_price):
-                    await self._close_quantity(symbol, plan.direction or "", managed.remaining_quantity / Decimal("2"))
+                    close_qty = managed.remaining_quantity / Decimal("2")
+                    await self._close_quantity(symbol, plan.direction or "", close_qty)
                     managed.remaining_quantity /= Decimal("2")
+                    if symbol in self.risk_manager.open_positions:
+                        self.risk_manager.open_positions[symbol].quantity = managed.remaining_quantity
                     managed.tp1_hit = True
+                    partial_pnl = self._calc_pnl(plan, price, close_qty)
+                    partial_r = self._calc_r_multiple(plan, price)
+                    self.risk_manager.register_closed_trade(symbol, partial_pnl, partial_r, remove_position=False)
                     if self.journal:
-                        await self.journal.log_event("TP1_HIT", "INFO", f"{symbol} TP1 hit", {"price": str(price)})
+                        await self.journal.log_partial_exit(symbol, price, close_qty, partial_pnl, partial_r, "TP1")
                     await self._send_close_alert(symbol, price, "TP1", True)
+
+                if not managed.tp1_hit:
+                    hard_sl = plan.sl_price
+                    if self._stop_hit(plan.direction or "", price, hard_sl):
+                        await self._close_quantity(symbol, plan.direction or "", managed.remaining_quantity)
+                        pnl = self._calc_pnl(plan, price, managed.remaining_quantity)
+                        r_multiple = self._calc_r_multiple(plan, price)
+                        self.open_trades.pop(symbol, None)
+                        self.risk_manager.register_closed_trade(symbol, pnl, r_multiple)
+                        if self.journal:
+                            await self.journal.log_trade_exit(symbol, price, "SL")
+                        await self._send_close_alert(symbol, price, "SL", False)
+                        continue
 
                 if managed.trailing_stop and self._stop_hit(plan.direction or "", price, managed.trailing_stop):
                     await self._close_quantity(symbol, plan.direction or "", managed.remaining_quantity)
+                    pnl = self._calc_pnl(plan, price, managed.remaining_quantity)
+                    r_multiple = self._calc_r_multiple(plan, price)
                     self.open_trades.pop(symbol, None)
-                    self.risk_manager.register_closed_trade(symbol, Decimal("0"), Decimal("0"))
+                    self.risk_manager.register_closed_trade(symbol, pnl, r_multiple)
                     if self.journal:
                         await self.journal.log_trade_exit(symbol, price, "TRAILING")
                     await self._send_close_alert(symbol, price, "TRAILING", self._is_win(plan, price))
@@ -188,8 +209,10 @@ class ExecutionEngine:
                     meaningful_move = abs(price - plan.entry_price) >= atr_value if atr_value > 0 else True
                     if not meaningful_move:
                         await self._close_quantity(symbol, plan.direction or "", managed.remaining_quantity)
+                        pnl = self._calc_pnl(plan, price, managed.remaining_quantity)
+                        r_multiple = self._calc_r_multiple(plan, price)
                         self.open_trades.pop(symbol, None)
-                        self.risk_manager.register_closed_trade(symbol, Decimal("0"), Decimal("0"))
+                        self.risk_manager.register_closed_trade(symbol, pnl, r_multiple)
                         if self.journal:
                             await self.journal.log_trade_exit(symbol, price, "TIME_STOP")
                         await self._send_close_alert(symbol, price, "TIME_STOP", self._is_win(plan, price))
@@ -206,6 +229,19 @@ class ExecutionEngine:
         side = "SELL" if direction == "LONG" else "BUY"
         result = await self.client.place_order(symbol=symbol, side=side, type="MARKET", quantity=_fmt(quantity))
         return ExecutionResult(result.accepted, result.order_id, result.status, result.reason, result.raw)
+
+    def _calc_pnl(self, plan: TradePlan, exit_price: Decimal, quantity: Decimal) -> Decimal:
+        if plan.direction == "LONG":
+            return (exit_price - plan.entry_price) * quantity
+        return (plan.entry_price - exit_price) * quantity
+
+    def _calc_r_multiple(self, plan: TradePlan, exit_price: Decimal) -> Decimal:
+        risk_per_unit = abs(plan.entry_price - plan.sl_price)
+        if risk_per_unit == 0:
+            return Decimal("0")
+        if plan.direction == "LONG":
+            return (exit_price - plan.entry_price) / risk_per_unit
+        return (plan.entry_price - exit_price) / risk_per_unit
 
     async def _send_close_alert(self, symbol: str, price: Decimal, exit_reason: str, is_win: bool) -> None:
         await self.alerter.send(
@@ -251,16 +287,41 @@ class ExecutionEngine:
     async def reconcile_orders(self) -> None:
         try:
             remote_orders = await self.client.get_open_orders()
-            remote_symbols = {order.get("symbol") for order in remote_orders}
-            internal_symbols = set(self.open_trades)
+            remote_symbols = {order.get("symbol") for order in remote_orders if order.get("symbol")}
+            internal_symbols = set(self.open_trades.keys())
             unknown = remote_symbols - internal_symbols
             if unknown and self.journal:
                 await self.journal.log_event(
                     "ORDER_RECONCILIATION",
                     "CRITICAL",
                     "Binance has open orders unknown to local state",
-                    {"symbols": sorted(symbol for symbol in unknown if symbol)},
+                    {"symbols": sorted(unknown)},
                 )
+            stale = internal_symbols - remote_symbols
+            for symbol in stale:
+                managed = self.open_trades.get(symbol)
+                if not managed:
+                    continue
+                try:
+                    await self.client.get_open_orders(symbol)
+                    price = await self._latest_price(symbol)
+                    if price <= 0:
+                        price = managed.plan.entry_price
+                    pnl = self._calc_pnl(managed.plan, price, managed.remaining_quantity)
+                    r_multiple = self._calc_r_multiple(managed.plan, price)
+                    self.open_trades.pop(symbol, None)
+                    self.risk_manager.register_closed_trade(symbol, pnl, r_multiple)
+                    if self.journal:
+                        await self.journal.log_trade_exit(symbol, price, "SL")
+                        await self.journal.log_event(
+                            "RECONCILE_CLOSE",
+                            "WARNING",
+                            f"{symbol} position found closed on Binance (OCO fired); cleaned up local state",
+                            {"symbol": symbol, "approx_exit": str(price)},
+                        )
+                    logger.warning(f"Reconcile: {symbol} was closed on Binance (OCO fired); local state cleaned up")
+                except Exception as exc:
+                    logger.warning(f"Reconcile cleanup failed for {symbol}: {exc}")
         except Exception as exc:
             logger.exception(f"Order reconciliation failed: {exc}")
 

@@ -87,7 +87,6 @@ class RiskManager:
         self._override_max_daily = float(cfg.max_daily_loss_pct)
         self._override_max_weekly = float(cfg.max_weekly_loss_pct)
         self._override_max_trades = int(cfg.max_concurrent_trades)
-        self._override_confidence = float(cfg.confidence_threshold)
 
     async def calculate(self, candidate: TradeCandidate) -> TradePlan:
         async with self.lock:
@@ -259,10 +258,17 @@ class RiskManager:
             lowest_price=plan.entry_price,
         )
 
-    def register_closed_trade(self, symbol: str, pnl_usd: Decimal | float | str, r_multiple: Decimal | float | str) -> None:
+    def register_closed_trade(
+        self,
+        symbol: str,
+        pnl_usd: Decimal | float | str,
+        r_multiple: Decimal | float | str,
+        remove_position: bool = True,
+    ) -> None:
         pnl = _d(pnl_usd)
         closed_at = datetime.now(UTC)
-        self.open_positions.pop(symbol, None)
+        if remove_position:
+            self.open_positions.pop(symbol, None)
         self.closed_trades.append(ClosedTradeStats(pnl, _d(r_multiple), closed_at))
         self.daily_realized[closed_at.date()] = self.daily_realized.get(closed_at.date(), Decimal("0")) + pnl
         week_key = closed_at.isocalendar()[:2]
@@ -328,7 +334,6 @@ class RiskManager:
             self._override_max_daily = float(self.settings.max_daily_loss_pct)
             self._override_max_weekly = float(self.settings.max_weekly_loss_pct)
             self._override_max_trades = int(self.settings.max_concurrent_trades)
-            self._override_confidence = float(self.settings.confidence_threshold)
             return
         try:
             overrides = json.loads(override_path.read_text(encoding="utf-8"))
@@ -338,7 +343,6 @@ class RiskManager:
             self._override_max_daily = float(overrides.get("max_daily_loss_pct", self.settings.max_daily_loss_pct))
             self._override_max_weekly = float(overrides.get("max_weekly_loss_pct", self.settings.max_weekly_loss_pct))
             self._override_max_trades = int(overrides.get("max_concurrent_trades", self.settings.max_concurrent_trades))
-            self._override_confidence = float(overrides.get("confidence_threshold", self.settings.confidence_threshold))
         except Exception as exc:
             logger.warning(f"Risk override load skipped: {exc}")
 
