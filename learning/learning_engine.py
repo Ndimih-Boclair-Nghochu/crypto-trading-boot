@@ -6,9 +6,11 @@ from typing import Any
 
 import pandas as pd
 
+from analysis.technical_analysis import enrich_indicators
 from db.connection import Database, database
 from models.lstm_model import LSTMModelService
 from models.rl_agent import RLAgentService
+from utils.alerts import AlertManager
 from utils.logger import logger
 
 
@@ -22,6 +24,7 @@ class LearningEngine:
         self.db = db
         self.lstm = lstm or LSTMModelService()
         self.rl = rl or RLAgentService()
+        self.alerter = AlertManager()
         self.trade_counter = 0
         self.last_weekly_run: datetime | None = None
 
@@ -38,6 +41,7 @@ class LearningEngine:
         try:
             await self.update_strategy_performance()
             await self.flag_and_retrain_weak_models()
+            await self.run_rl_online_update()
             await self.detect_regime_shift()
         except Exception as exc:
             logger.exception(f"Learning engine failed without stopping trading: {exc}")
@@ -108,6 +112,28 @@ class LearningEngine:
             if frame is not None and len(frame) > 100:
                 metrics = self.lstm.train(symbol, frame)
                 logger.warning(f"Retrained LSTM for {symbol} after weak win rate: {metrics}")
+                await self.alerter.send(
+                    f"MODEL RETRAINED: {symbol} LSTM",
+                    {"reason": "win_rate_below_45_percent", "metrics": metrics},
+                )
+            rl_snapshots = await self.db.fetch_all(
+                """
+                SELECT raw_candles
+                FROM market_snapshots
+                WHERE symbol = :symbol AND raw_candles IS NOT NULL
+                ORDER BY captured_at DESC
+                LIMIT 100
+                """,
+                {"symbol": symbol},
+            )
+            rl_frame = self._snapshots_to_frame(rl_snapshots)
+            if rl_frame is not None and len(rl_frame) > 50:
+                self.rl.online_update(rl_frame.to_dict(orient="records"), timesteps=2_000)
+                logger.info(f"RL agent online update complete for {symbol}")
+                await self.alerter.send(
+                    f"RL ONLINE UPDATE COMPLETE: {symbol}",
+                    {"samples": len(rl_frame), "timesteps": 2_000},
+                )
             await self.db.execute(
                 """
                 INSERT INTO system_events (event_type, severity, message, context)
@@ -120,6 +146,28 @@ class LearningEngine:
                     ),
                 },
             )
+
+    async def run_rl_online_update(self) -> None:
+        """Run RL online update from the most recent market snapshots across all symbols."""
+        try:
+            rows = await self.db.fetch_all(
+                """
+                SELECT raw_candles
+                FROM market_snapshots
+                WHERE raw_candles IS NOT NULL
+                ORDER BY captured_at DESC
+                LIMIT 200
+                """
+            )
+            frame = self._snapshots_to_frame(rows)
+            if frame is not None and len(frame) > 50:
+                self.rl.online_update(frame.to_dict(orient="records"), timesteps=2_000)
+                await self.alerter.send(
+                    "RL ONLINE UPDATE COMPLETE",
+                    {"samples": len(frame), "timesteps": 2_000},
+                )
+        except Exception as exc:
+            logger.warning(f"RL online update skipped: {exc}")
 
     async def detect_regime_shift(self) -> None:
         rows = await self.db.fetch_all(
@@ -160,4 +208,20 @@ class LearningEngine:
                 rows.extend(item for item in raw if isinstance(item, dict))
         if not rows:
             return None
-        return pd.DataFrame(rows).drop_duplicates().sort_index()
+        frame = pd.DataFrame(rows)
+        if "open_time" in frame.columns:
+            frame = frame.sort_values("open_time").drop_duplicates(subset=["open_time"]).reset_index(drop=True)
+        else:
+            frame = frame.drop_duplicates().reset_index(drop=True)
+        if "timestamp" in frame.columns:
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+            frame = frame.set_index("timestamp", drop=False)
+        elif "open_time" in frame.columns:
+            frame["timestamp"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True, errors="coerce")
+            frame = frame.set_index("timestamp", drop=False)
+        if "atr_14" not in frame.columns and all(column in frame.columns for column in ("high", "low", "close")):
+            try:
+                frame = enrich_indicators(frame).replace([float("inf"), float("-inf")], pd.NA).ffill().bfill()
+            except Exception as exc:
+                logger.warning(f"Could not enrich snapshot frame: {exc}")
+        return frame if len(frame) > 10 else None

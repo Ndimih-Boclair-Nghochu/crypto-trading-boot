@@ -24,6 +24,7 @@ services:
     volumes:
       - ./models/weights:/app/models/weights
       - ./logs:/app/logs
+      - runtime_data:/app/.runtime
 
   dashboard:
     build: .
@@ -37,6 +38,8 @@ services:
     volumes:
       - ./models/weights:/app/models/weights
       - ./logs:/app/logs
+      - runtime_data:/app/.runtime
 
 volumes:
   pgdata:
+  runtime_data:

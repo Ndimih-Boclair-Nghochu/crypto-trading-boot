@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
@@ -82,6 +83,11 @@ class RiskManager:
         self.daily_realized: dict[date, Decimal] = {}
         self.weekly_realized: dict[tuple[int, int], Decimal] = {}
         self.circuit_breaker_active = False
+        self._override_max_risk = float(cfg.max_risk_per_trade_pct)
+        self._override_max_daily = float(cfg.max_daily_loss_pct)
+        self._override_max_weekly = float(cfg.max_weekly_loss_pct)
+        self._override_max_trades = int(cfg.max_concurrent_trades)
+        self._override_confidence = float(cfg.confidence_threshold)
 
     async def calculate(self, candidate: TradeCandidate) -> TradePlan:
         async with self.lock:
@@ -92,6 +98,7 @@ class RiskManager:
                 return TradePlan(False, f"risk manager error: {exc}", [])
 
     def _calculate_locked(self, candidate: TradeCandidate) -> TradePlan:
+        self._load_overrides()
         signal = candidate.signal
         entry = _d(candidate.entry_price)
         atr_value = _d(candidate.atr)
@@ -119,8 +126,8 @@ class RiskManager:
         checklist.append(
             ChecklistItem(
                 "Max concurrent trades not exceeded",
-                len(self.open_positions) < self.settings.max_concurrent_trades,
-                f"{len(self.open_positions)}/{self.settings.max_concurrent_trades}",
+                len(self.open_positions) < self._override_max_trades,
+                f"{len(self.open_positions)}/{self._override_max_trades}",
             )
         )
 
@@ -132,7 +139,7 @@ class RiskManager:
             return self._blocked("daily loss limit hit", checklist)
         if self.weekly_loss_limit_hit(balance):
             return self._blocked("weekly loss limit hit", checklist)
-        if len(self.open_positions) >= self.settings.max_concurrent_trades:
+        if len(self.open_positions) >= self._override_max_trades:
             return self._blocked("max concurrent open trades exceeded", checklist)
         if entry <= 0 or atr_value <= 0 or balance <= 0:
             checklist.append(ChecklistItem("Position size calculated and within limits", False, "invalid entry/ATR/balance"))
@@ -170,7 +177,7 @@ class RiskManager:
         checklist.append(
             ChecklistItem(
                 "Position size calculated and within limits",
-                quantity > 0 and trade_risk_pct <= _d(self.settings.max_risk_per_trade_pct),
+                quantity > 0 and trade_risk_pct <= _d(self._override_max_risk),
                 f"qty={quantity}, risk={trade_risk_pct:.4f}%",
             )
         )
@@ -209,7 +216,7 @@ class RiskManager:
         )
 
     def _position_size(self, balance: Decimal, entry: Decimal, atr_value: Decimal, risk_per_unit: Decimal) -> Decimal:
-        risk_fraction = _d(self.settings.max_risk_per_trade_pct) / Decimal("100")
+        risk_fraction = _d(self._override_max_risk) / Decimal("100")
         fixed_fractional = (balance * risk_fraction) / risk_per_unit
         atr_based = (balance * Decimal("0.01")) / (Decimal("2") * atr_value)
         half_kelly = self._half_kelly_fraction()
@@ -278,10 +285,10 @@ class RiskManager:
         return position.sl_price
 
     def daily_loss_limit_hit(self, balance: Decimal) -> bool:
-        return self._today_realized_pct(balance) <= -self.settings.max_daily_loss_pct
+        return self._today_realized_pct(balance) <= -self._override_max_daily
 
     def weekly_loss_limit_hit(self, balance: Decimal) -> bool:
-        return self._week_realized_pct(balance) <= -self.settings.max_weekly_loss_pct
+        return self._week_realized_pct(balance) <= -self._override_max_weekly
 
     def circuit_breaker_hit(self, equity: Decimal | float | str) -> bool:
         current = _d(equity)
@@ -313,6 +320,27 @@ class RiskManager:
 
     def _blocked(self, reason: str, checklist: list[ChecklistItem]) -> TradePlan:
         return TradePlan(False, reason, checklist)
+
+    def _load_overrides(self) -> None:
+        override_path = self.settings.runtime_dir / "risk_overrides.json"
+        if not override_path.exists():
+            self._override_max_risk = float(self.settings.max_risk_per_trade_pct)
+            self._override_max_daily = float(self.settings.max_daily_loss_pct)
+            self._override_max_weekly = float(self.settings.max_weekly_loss_pct)
+            self._override_max_trades = int(self.settings.max_concurrent_trades)
+            self._override_confidence = float(self.settings.confidence_threshold)
+            return
+        try:
+            overrides = json.loads(override_path.read_text(encoding="utf-8"))
+            self._override_max_risk = float(
+                overrides.get("max_risk_per_trade_pct", self.settings.max_risk_per_trade_pct)
+            )
+            self._override_max_daily = float(overrides.get("max_daily_loss_pct", self.settings.max_daily_loss_pct))
+            self._override_max_weekly = float(overrides.get("max_weekly_loss_pct", self.settings.max_weekly_loss_pct))
+            self._override_max_trades = int(overrides.get("max_concurrent_trades", self.settings.max_concurrent_trades))
+            self._override_confidence = float(overrides.get("confidence_threshold", self.settings.confidence_threshold))
+        except Exception as exc:
+            logger.warning(f"Risk override load skipped: {exc}")
 
 
 def _d(value: Decimal | float | str | int) -> Decimal:

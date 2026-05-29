@@ -4,9 +4,9 @@ import asyncio
 import json
 import time
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
+import nest_asyncio
 import pandas as pd
 import streamlit as st
 
@@ -15,6 +15,7 @@ from db.connection import Database
 
 
 STATE_PATH = settings.trading_state_path
+RISK_OVERRIDE_PATH = settings.runtime_dir / "risk_overrides.json"
 
 
 def read_state() -> dict[str, Any]:
@@ -27,13 +28,30 @@ def read_state() -> dict[str, Any]:
 
 
 def write_state(enabled: bool) -> None:
+    state = read_state()
+    state.update(
+        {
+            "trading_enabled": enabled,
+            "status": "ANALYZING" if enabled else "PAUSED",
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+    )
+    write_state_dict(state)
+
+
+def write_state_dict(state_dict: dict[str, Any]) -> None:
     STATE_PATH.parent.mkdir(exist_ok=True)
-    payload = {
-        "trading_enabled": enabled,
-        "status": "ANALYZING" if enabled else "PAUSED",
-        "updated_at": datetime.now(UTC).isoformat(),
-    }
-    STATE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    state_dict["updated_at"] = datetime.now(UTC).isoformat()
+    STATE_PATH.write_text(json.dumps(state_dict, indent=2), encoding="utf-8")
+
+
+def read_risk_overrides() -> dict[str, Any]:
+    if not RISK_OVERRIDE_PATH.exists():
+        return {}
+    try:
+        return json.loads(RISK_OVERRIDE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 async def fetch_dashboard_data() -> dict[str, Any]:
@@ -82,7 +100,8 @@ def main() -> None:
         st.metric("UTC Time", datetime.now(UTC).strftime("%H:%M:%S"))
         st.metric("Binance", "TESTNET" if settings.use_testnet else "LIVE")
 
-    data = asyncio.run(fetch_dashboard_data())
+    nest_asyncio.apply()
+    data = asyncio.get_event_loop().run_until_complete(fetch_dashboard_data())
     trades = pd.DataFrame(data["trades"])
     open_positions = pd.DataFrame(data["open_positions"])
     equity = pd.DataFrame(data["equity"])
@@ -109,18 +128,21 @@ def main() -> None:
     if open_positions.empty:
         st.info("No open positions.")
     else:
-        cols = [
-            "symbol",
-            "direction",
-            "entry_price",
-            "sl_price",
-            "tp1_price",
-            "tp2_price",
-            "quantity",
-            "entry_time",
-            "strategy_used",
-        ]
-        st.dataframe(open_positions[[c for c in cols if c in open_positions]], use_container_width=True, hide_index=True)
+        cols_to_show = ["symbol", "direction", "entry_price", "sl_price", "tp1_price", "quantity", "entry_time"]
+        for _, row in open_positions.iterrows():
+            col_data, col_btn = st.columns([5, 1])
+            with col_data:
+                st.write({c: row.get(c, "") for c in cols_to_show if c in row})
+            with col_btn:
+                symbol = str(row.get("symbol", ""))
+                if st.button(f"Close {symbol}", key=f"close_{row.get('trade_id', '')}"):
+                    state = read_state()
+                    closes = state.get("close_requests", [])
+                    closes.append(symbol)
+                    state["close_requests"] = closes
+                    write_state_dict(state)
+                    st.warning(f"Close request sent for {symbol}")
+                    st.rerun()
 
     st.subheader("Market Analysis")
     if no_trade.empty:
@@ -155,13 +177,53 @@ def main() -> None:
         else:
             st.info("No equity curve yet.")
 
-    st.subheader("Risk Settings")
+    st.subheader("Risk Settings (editable - takes effect on next trade cycle)")
+    overrides = read_risk_overrides()
     r1, r2, r3, r4, r5 = st.columns(5)
-    r1.number_input("Risk %", value=float(settings.max_risk_per_trade_pct), disabled=True)
-    r2.number_input("Daily Loss %", value=float(settings.max_daily_loss_pct), disabled=True)
-    r3.number_input("Weekly Loss %", value=float(settings.max_weekly_loss_pct), disabled=True)
-    r4.number_input("Max Trades", value=int(settings.max_concurrent_trades), disabled=True)
-    r5.number_input("Confidence", value=float(settings.confidence_threshold), disabled=True)
+    risk_pct = r1.number_input(
+        "Risk %",
+        value=float(overrides.get("max_risk_per_trade_pct", settings.max_risk_per_trade_pct)),
+        min_value=0.1,
+        max_value=5.0,
+        step=0.1,
+    )
+    daily_pct = r2.number_input(
+        "Daily Loss %",
+        value=float(overrides.get("max_daily_loss_pct", settings.max_daily_loss_pct)),
+        min_value=1.0,
+        max_value=20.0,
+    )
+    weekly_pct = r3.number_input(
+        "Weekly Loss %",
+        value=float(overrides.get("max_weekly_loss_pct", settings.max_weekly_loss_pct)),
+        min_value=1.0,
+        max_value=30.0,
+    )
+    max_trades = r4.number_input(
+        "Max Trades",
+        value=int(overrides.get("max_concurrent_trades", settings.max_concurrent_trades)),
+        min_value=1,
+        max_value=10,
+        step=1,
+    )
+    confidence = r5.number_input(
+        "Confidence Threshold",
+        value=float(overrides.get("confidence_threshold", settings.confidence_threshold)),
+        min_value=0.5,
+        max_value=0.99,
+        step=0.01,
+    )
+    if st.button("Save Risk Settings"):
+        risk_overrides = {
+            "max_risk_per_trade_pct": risk_pct,
+            "max_daily_loss_pct": daily_pct,
+            "max_weekly_loss_pct": weekly_pct,
+            "max_concurrent_trades": int(max_trades),
+            "confidence_threshold": confidence,
+        }
+        RISK_OVERRIDE_PATH.parent.mkdir(exist_ok=True)
+        RISK_OVERRIDE_PATH.write_text(json.dumps(risk_overrides, indent=2), encoding="utf-8")
+        st.success("Risk settings saved. Active on next trade cycle.")
 
     st.subheader("System Events")
     if events.empty:

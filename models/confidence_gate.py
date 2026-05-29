@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -44,11 +45,14 @@ class ConfidenceGate:
         direction = lstm_signal.direction
         confluence = indicators.get("confluence", {})
         primary = self._primary_latest(indicators)
+        extreme_regime = "EXTREME" in str(indicators.get("regime", ""))
+        base_threshold = self._confidence_threshold()
+        threshold = base_threshold * 0.85 if extreme_regime else base_threshold
 
         if direction not in {"LONG", "SHORT"}:
             reasons.append("LSTM output is NO_TRADE")
-        if lstm_signal.confidence < self.settings.confidence_threshold:
-            reasons.append(f"LSTM confidence {lstm_signal.confidence:.2f} below {self.settings.confidence_threshold:.2f}")
+        if lstm_signal.confidence < threshold:
+            reasons.append(f"LSTM confidence {lstm_signal.confidence:.2f} below {threshold:.2f}")
 
         expected_action = "BUY" if direction == "LONG" else "SELL"
         if rl_decision.action != expected_action:
@@ -81,6 +85,17 @@ class ConfidenceGate:
         if frames:
             return next(iter(frames.values())).get("latest", {})
         return indicators.get("latest", {})
+
+    def _confidence_threshold(self) -> float:
+        override_path = self.settings.runtime_dir / "risk_overrides.json"
+        if not override_path.exists():
+            return float(self.settings.confidence_threshold)
+        try:
+            overrides = json.loads(override_path.read_text(encoding="utf-8"))
+            return float(overrides.get("confidence_threshold", self.settings.confidence_threshold))
+        except Exception as exc:
+            logger.warning(f"Confidence threshold override skipped: {exc}")
+            return float(self.settings.confidence_threshold)
 
     def _indicator_agreement(self, latest: dict[str, Any], direction: str) -> int:
         if direction not in {"LONG", "SHORT"}:

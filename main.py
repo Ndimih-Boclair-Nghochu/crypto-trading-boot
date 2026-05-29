@@ -22,6 +22,7 @@ from models.rl_agent import RLAgentService
 from trading.execution_engine import ExecutionEngine
 from trading.risk_manager import RiskManager, TradeCandidate
 from trading.strategy_engine import StrategyEngine
+from utils.alerts import AlertManager
 from utils.binance_client import ResilientBinanceClient
 from utils.logger import logger
 
@@ -39,6 +40,7 @@ class TradingSystem:
         self.journal = Journal()
         self.execution = ExecutionEngine(self.client, self.risk, self.journal)
         self.learning = LearningEngine(database, self.lstm, self.rl)
+        self.alerter = AlertManager()
         self._reconcile_at = datetime.now(UTC)
 
     async def start(self) -> None:
@@ -62,6 +64,7 @@ class TradingSystem:
         try:
             while True:
                 try:
+                    await self._process_close_requests()
                     if not self.trading_enabled():
                         await self._set_status("PAUSED")
                         await asyncio.sleep(5)
@@ -78,8 +81,37 @@ class TradingSystem:
 
                         primary = self.strategy.primary_frame(analysis)
                         lstm_signal = self.lstm.predict(symbol, primary)
-                        rl_state = self.strategy.build_rl_state(analysis, lstm_signal)
+                        latest_for_state = self.strategy.primary_latest(analysis)
+                        existing_position = self.risk.open_positions.get(symbol)
+                        open_pnl = 0.0
+                        position_flag = 0.0
+                        entry_price = 0.0
+                        if existing_position:
+                            current_price = float(latest_for_state.get("close", 0) or 0)
+                            if existing_position.direction == "LONG":
+                                open_pnl = float(existing_position.quantity) * (
+                                    current_price - float(existing_position.entry_price)
+                                )
+                                position_flag = 1.0
+                            else:
+                                open_pnl = float(existing_position.quantity) * (
+                                    float(existing_position.entry_price) - current_price
+                                )
+                                position_flag = -1.0
+                            entry_price = float(existing_position.entry_price)
+                        peak = float(self.risk.peak_equity) if self.risk.peak_equity > 0 else 1.0
+                        current_eq = float(self.risk.current_equity) if self.risk.current_equity > 0 else 1.0
+                        drawdown = max(0.0, (peak - current_eq) / peak)
+                        rl_state = self.strategy.build_rl_state(
+                            analysis,
+                            lstm_signal,
+                            open_pnl=open_pnl,
+                            drawdown=drawdown,
+                            position=position_flag,
+                            entry_price=entry_price,
+                        )
                         rl_decision = self.rl.decide(rl_state)
+                        analysis["regime"] = str(self.strategy.classify_regime(analysis, meta.fear_greed).value)
                         gate = await self.gate.passes(lstm_signal, rl_decision, analysis, symbol)
                         signal = self.strategy.build_trade_signal(symbol, analysis, lstm_signal, rl_decision, gate, meta.fear_greed)
 
@@ -115,6 +147,24 @@ class TradingSystem:
                         else:
                             await self.journal.log_event("ORDER_REJECTED", "WARNING", result.reason or "order rejected", {"symbol": symbol})
 
+                    await self._write_equity_snapshot()
+                    if self.risk.circuit_breaker_active and self.execution.open_trades:
+                        logger.critical("CIRCUIT BREAKER ACTIVE - emergency closing all positions")
+                        await self.journal.log_event(
+                            "CIRCUIT_BREAKER_TRIGGERED",
+                            "CRITICAL",
+                            f"Drawdown exceeded {settings.drawdown_circuit_breaker_pct}% - closing all positions",
+                            {"open_trades": list(self.execution.open_trades.keys())},
+                        )
+                        await self.execution.emergency_close_all()
+                        await self.alerter.send(
+                            "CIRCUIT BREAKER TRIGGERED",
+                            {
+                                "reason": f"Drawdown > {settings.drawdown_circuit_breaker_pct}%",
+                                "all_positions_closed": True,
+                            },
+                        )
+
                     if datetime.now(UTC) >= self._reconcile_at:
                         await self.execution.reconcile_orders()
                         self._reconcile_at = datetime.now(UTC) + timedelta(minutes=5)
@@ -129,6 +179,53 @@ class TradingSystem:
     async def learning_tick(self) -> None:
         await self.learning.record_state()
 
+    async def _get_current_price(self, symbol: str) -> Decimal:
+        candles = await self.client.get_ohlcv(symbol, "1m", 1)
+        return candles[-1].close if candles else Decimal("0")
+
+    async def _write_equity_snapshot(self) -> None:
+        try:
+            balance = await self.client.get_usdt_balance()
+            open_pnl = Decimal("0")
+            for position in self.risk.open_positions.values():
+                current_price = await self._get_current_price(position.symbol)
+                if current_price <= 0:
+                    continue
+                if position.direction == "LONG":
+                    open_pnl += position.quantity * (current_price - position.entry_price)
+                else:
+                    open_pnl += position.quantity * (position.entry_price - current_price)
+            total_equity = Decimal(str(balance)) + open_pnl
+            self.risk.circuit_breaker_hit(total_equity)
+            peak = self.risk.peak_equity if self.risk.peak_equity > 0 else total_equity
+            drawdown_pct = ((peak - total_equity) / peak * Decimal("100")) if peak > 0 else Decimal("0")
+            await self.journal.log_equity(
+                balance_usdt=balance,
+                open_pnl=open_pnl,
+                total_equity=total_equity,
+                peak_equity=peak,
+                drawdown_pct=drawdown_pct,
+            )
+        except Exception as exc:
+            logger.warning(f"Equity snapshot failed: {exc}")
+
+    async def _process_close_requests(self) -> None:
+        state_path = settings.trading_state_path
+        if not state_path.exists():
+            return
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            close_requests = [symbol for symbol in state.get("close_requests", []) if symbol]
+            for symbol in close_requests:
+                logger.info(f"Manual close request received for {symbol}")
+                await self.execution.emergency_close_symbol(symbol)
+                await self.journal.log_event("MANUAL_CLOSE", "INFO", f"Manual close triggered for {symbol}", {})
+            if close_requests:
+                state["close_requests"] = []
+                state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logger.warning(f"Close request processing failed: {exc}")
+
     def trading_enabled(self) -> bool:
         path = settings.trading_state_path
         if not path.exists():
@@ -142,7 +239,11 @@ class TradingSystem:
     async def _set_status(self, status: str) -> None:
         path = settings.trading_state_path
         path.parent.mkdir(exist_ok=True)
-        state = {"trading_enabled": self.trading_enabled(), "status": status, "updated_at": datetime.now(UTC).isoformat()}
+        try:
+            state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except Exception:
+            state = {}
+        state.update({"trading_enabled": bool(state.get("trading_enabled", False)), "status": status, "updated_at": datetime.now(UTC).isoformat()})
         path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 

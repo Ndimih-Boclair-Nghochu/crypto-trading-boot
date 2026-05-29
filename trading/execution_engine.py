@@ -8,6 +8,7 @@ from typing import Any
 
 from learning.journal import Journal
 from trading.risk_manager import RiskManager, TradePlan
+from utils.alerts import AlertManager
 from utils.binance_client import OrderResult, ResilientBinanceClient
 from utils.logger import logger
 
@@ -44,6 +45,7 @@ class ExecutionEngine:
         self.open_trades: dict[str, ManagedTrade] = {}
         self.lock = asyncio.Lock()
         self._monitor_task: asyncio.Task[None] | None = None
+        self.alerter = AlertManager()
 
     async def place_trade(self, plan: TradePlan) -> ExecutionResult:
         if not plan.approved or not plan.symbol or not plan.direction:
@@ -85,6 +87,17 @@ class ExecutionEngine:
                 self.open_trades[plan.symbol] = ManagedTrade(plan=plan, entry_order_id=entry_order_id, remaining_quantity=plan.quantity)
                 if self.journal:
                     await self.journal.log_trade_open(plan, entry_order_id)
+                await self.alerter.send(
+                    f"✅ TRADE OPENED: {plan.symbol} {plan.direction}",
+                    {
+                        "entry": str(plan.entry_price),
+                        "sl": str(plan.sl_price),
+                        "tp1": str(plan.tp1_price),
+                        "size": str(plan.quantity),
+                        "strategy": plan.strategy_used,
+                        "confidence": f"{plan.lstm_confidence:.0%}",
+                    },
+                )
                 self.start_monitoring()
                 return ExecutionResult(True, entry_order_id, "FILLED_OR_MONITORING", raw=entry.raw)
             except Exception as exc:
@@ -160,6 +173,7 @@ class ExecutionEngine:
                     managed.tp1_hit = True
                     if self.journal:
                         await self.journal.log_event("TP1_HIT", "INFO", f"{symbol} TP1 hit", {"price": str(price)})
+                    await self._send_close_alert(symbol, price, "TP1", True)
 
                 if managed.trailing_stop and self._stop_hit(plan.direction or "", price, managed.trailing_stop):
                     await self._close_quantity(symbol, plan.direction or "", managed.remaining_quantity)
@@ -167,6 +181,7 @@ class ExecutionEngine:
                     self.risk_manager.register_closed_trade(symbol, Decimal("0"), Decimal("0"))
                     if self.journal:
                         await self.journal.log_trade_exit(symbol, price, "TRAILING")
+                    await self._send_close_alert(symbol, price, "TRAILING", self._is_win(plan, price))
                     continue
 
                 if datetime.now(UTC) - managed.opened_at >= timedelta(hours=4):
@@ -177,6 +192,7 @@ class ExecutionEngine:
                         self.risk_manager.register_closed_trade(symbol, Decimal("0"), Decimal("0"))
                         if self.journal:
                             await self.journal.log_trade_exit(symbol, price, "TIME_STOP")
+                        await self._send_close_alert(symbol, price, "TIME_STOP", self._is_win(plan, price))
 
     async def _latest_price(self, symbol: str) -> Decimal:
         candles = await self.client.get_ohlcv(symbol, "1m", 1)
@@ -191,6 +207,17 @@ class ExecutionEngine:
         result = await self.client.place_order(symbol=symbol, side=side, type="MARKET", quantity=_fmt(quantity))
         return ExecutionResult(result.accepted, result.order_id, result.status, result.reason, result.raw)
 
+    async def _send_close_alert(self, symbol: str, price: Decimal, exit_reason: str, is_win: bool) -> None:
+        await self.alerter.send(
+            f"{'✅ WIN' if is_win else '❌ LOSS'}: {symbol} closed",
+            {"exit_price": str(price), "reason": exit_reason, "pnl_approx": "see dashboard"},
+        )
+
+    def _is_win(self, plan: TradePlan, price: Decimal) -> bool:
+        if plan.direction == "LONG":
+            return price >= plan.entry_price
+        return price <= plan.entry_price
+
     async def emergency_close_all(self) -> list[ExecutionResult]:
         async with self.lock:
             results = []
@@ -199,6 +226,10 @@ class ExecutionEngine:
                 self.open_trades.pop(symbol, None)
                 if self.journal:
                     await self.journal.log_trade_exit(symbol, Decimal("0"), "MANUAL")
+                await self.alerter.send(
+                    f"MANUAL CLOSE: {symbol}",
+                    {"reason": "MANUAL", "pnl_approx": "see dashboard"},
+                )
             return results
 
     async def emergency_close_symbol(self, symbol: str) -> ExecutionResult:
@@ -211,6 +242,10 @@ class ExecutionEngine:
                 self.open_trades.pop(symbol, None)
                 if self.journal:
                     await self.journal.log_trade_exit(symbol, Decimal("0"), "MANUAL")
+                await self.alerter.send(
+                    f"MANUAL CLOSE: {symbol}",
+                    {"reason": "MANUAL", "pnl_approx": "see dashboard"},
+                )
             return result
 
     async def reconcile_orders(self) -> None:
