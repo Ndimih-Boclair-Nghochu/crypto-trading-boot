@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: crypto_bot
+      POSTGRES_USER: botuser
+      POSTGRES_PASSWORD: strongpassword
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U botuser -d crypto_bot"]
+      interval: 10s
+      retries: 5
+
+  bot:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    command: python main.py
+    volumes:
+      - ./models/weights:/app/models/weights
+      - ./logs:/app/logs
+
+  dashboard:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    command: streamlit run dashboard.py --server.address=0.0.0.0
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./models/weights:/app/models/weights
+      - ./logs:/app/logs
+
+volumes:
+  pgdata:
