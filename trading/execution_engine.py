@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -9,7 +9,7 @@ from typing import Any
 from learning.journal import Journal
 from trading.risk_manager import RiskManager, TradePlan
 from utils.alerts import AlertManager
-from utils.binance_client import OrderResult, ResilientBinanceClient
+from utils.binance_client import OrderResult, ResilientBinanceClient, SymbolFilters
 from utils.logger import logger
 
 
@@ -52,9 +52,13 @@ class ExecutionEngine:
             return ExecutionResult(False, reason=plan.reason)
         async with self.lock:
             try:
+                prepared = await self._prepare_plan_for_filters(plan)
+                if isinstance(prepared, ExecutionResult):
+                    return prepared
+                plan = prepared
                 balance = await self.client.get_usdt_balance()
                 if balance <= 0 or (plan.entry_price * plan.quantity) > balance:
-                    return ExecutionResult(False, reason="insufficient final Binance balance")
+                    return await self._reject_execution(plan, "insufficient final Binance balance")
 
                 side = "BUY" if plan.direction == "LONG" else "SELL"
                 entry = await self.client.place_order(
@@ -66,7 +70,7 @@ class ExecutionEngine:
                     price=_fmt(plan.entry_price),
                 )
                 if not entry.accepted or not entry.order_id:
-                    return ExecutionResult(False, status=entry.status, reason=entry.reason, raw=entry.raw)
+                    return await self._reject_execution(plan, entry.reason or "entry order rejected", entry.status, entry.raw)
 
                 filled = await self._wait_for_fill(plan.symbol, entry.order_id, timeout_seconds=30)
                 entry_order_id = entry.order_id
@@ -79,10 +83,20 @@ class ExecutionEngine:
                         quantity=_fmt(plan.quantity),
                     )
                     if not fallback.accepted or not fallback.order_id:
-                        return ExecutionResult(False, status=fallback.status, reason=fallback.reason, raw=fallback.raw)
+                        return await self._reject_execution(
+                            plan, fallback.reason or "market fallback rejected", fallback.status, fallback.raw
+                        )
                     entry_order_id = fallback.order_id
 
-                await self._place_protection(plan)
+                protection = await self._place_protection(plan)
+                if not protection.accepted:
+                    await self._close_quantity(plan.symbol, plan.direction, plan.quantity)
+                    return await self._reject_execution(
+                        plan,
+                        protection.reason or "protective OCO rejected; entry closed",
+                        protection.status,
+                        protection.raw,
+                    )
                 self.risk_manager.register_open_position(plan)
                 self.open_trades[plan.symbol] = ManagedTrade(plan=plan, entry_order_id=entry_order_id, remaining_quantity=plan.quantity)
                 if self.journal:
@@ -104,6 +118,52 @@ class ExecutionEngine:
                 logger.exception(f"Trade execution failed closed for {plan.symbol}: {exc}")
                 return ExecutionResult(False, reason=str(exc))
 
+    async def _prepare_plan_for_filters(self, plan: TradePlan) -> TradePlan | ExecutionResult:
+        if not plan.symbol:
+            return ExecutionResult(False, reason="Filter violation: missing symbol")
+        filters = await self.client.get_symbol_filters(plan.symbol)
+        if not filters:
+            return await self._reject_execution(plan, f"Filter violation: missing exchange filters for {plan.symbol}")
+        quantity = filters.round_quantity(plan.quantity)
+        entry_price = filters.round_price(plan.entry_price)
+        sl_price = filters.round_price(plan.sl_price)
+        tp1_price = filters.round_price(plan.tp1_price)
+        tp2_price = filters.round_price(plan.tp2_price) if plan.tp2_price else None
+        ok, reason = filters.validate_order(entry_price, quantity)
+        if not ok:
+            return await self._reject_execution(plan, f"Filter violation: {reason}", "FILTER_REJECTED")
+        if quantity != plan.quantity or entry_price != plan.entry_price:
+            logger.info(
+                f"Rounded {plan.symbol} order to Binance filters: qty {plan.quantity}->{quantity}, "
+                f"entry {plan.entry_price}->{entry_price}"
+            )
+        return replace(
+            plan,
+            quantity=quantity,
+            entry_price=entry_price,
+            sl_price=sl_price,
+            tp1_price=tp1_price,
+            tp2_price=tp2_price,
+        )
+
+    async def _reject_execution(
+        self,
+        plan: TradePlan,
+        reason: str,
+        status: str = "REJECTED",
+        raw: dict[str, Any] | None = None,
+    ) -> ExecutionResult:
+        logger.warning(f"Execution rejected for {plan.symbol}: {reason}")
+        if self.journal:
+            await self.journal.log_event(
+                "ORDER_REJECTED",
+                "WARNING",
+                reason,
+                {"symbol": plan.symbol, "status": status, "raw": raw or {}},
+            )
+        await self.alerter.send(f"ORDER REJECTED: {plan.symbol}", {"reason": reason, "status": status})
+        return ExecutionResult(False, status=status, reason=reason, raw=raw)
+
     async def _wait_for_fill(self, symbol: str, order_id: str, timeout_seconds: int) -> bool:
         deadline = datetime.now(UTC) + timedelta(seconds=timeout_seconds)
         while datetime.now(UTC) < deadline:
@@ -115,6 +175,13 @@ class ExecutionEngine:
 
     async def _place_protection(self, plan: TradePlan) -> OrderResult:
         side = "SELL" if plan.direction == "LONG" else "BUY"
+        filters = await self.client.get_symbol_filters(plan.symbol or "")
+        oco_quantity = plan.quantity / Decimal("2")
+        if filters:
+            oco_quantity = filters.round_quantity(oco_quantity)
+            ok, reason = filters.validate_order(plan.tp1_price, oco_quantity)
+            if not ok:
+                return OrderResult(False, status="FILTER_REJECTED", reason=f"Filter violation: OCO {reason}")
         if plan.direction == "LONG":
             oco_kwargs = {
                 "aboveType": "LIMIT_MAKER",
@@ -136,7 +203,7 @@ class ExecutionEngine:
         return await self.client.place_oco_order(
             symbol=plan.symbol,
             side=side,
-            quantity=_fmt(plan.quantity / Decimal("2")),
+            quantity=_fmt(oco_quantity),
             **oco_kwargs,
         )
 
@@ -226,6 +293,11 @@ class ExecutionEngine:
     async def _close_quantity(self, symbol: str, direction: str, quantity: Decimal) -> ExecutionResult:
         if quantity <= 0:
             return ExecutionResult(False, reason="quantity <= 0")
+        filters = await self.client.get_symbol_filters(symbol)
+        if filters:
+            quantity = filters.round_quantity(quantity)
+            if filters.min_qty > 0 and quantity < filters.min_qty:
+                return ExecutionResult(False, status="FILTER_REJECTED", reason=f"quantity {quantity} below minQty {filters.min_qty}")
         side = "SELL" if direction == "LONG" else "BUY"
         result = await self.client.place_order(symbol=symbol, side=side, type="MARKET", quantity=_fmt(quantity))
         return ExecutionResult(result.accepted, result.order_id, result.status, result.reason, result.raw)

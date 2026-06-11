@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 
 from trading.execution_engine import ExecutionEngine, ManagedTrade
 from trading.risk_manager import RiskManager, TradePlan
-from utils.binance_client import OrderResult
+from utils.binance_client import OrderResult, SymbolFilters
 
 
 class FakeClient:
@@ -15,6 +16,13 @@ class FakeClient:
         self.cancelled: list[str] = []
         self.current_price = Decimal("100")
         self.open_orders: list[dict] = []
+        self.filters = SymbolFilters(
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.01"),
+            step_size=Decimal("0.0001"),
+            min_notional=Decimal("10"),
+            min_qty=Decimal("0.0001"),
+        )
 
     async def get_usdt_balance(self) -> Decimal:
         return Decimal("10000")
@@ -41,6 +49,9 @@ class FakeClient:
 
     async def get_ohlcv(self, symbol: str, interval: str, limit: int = 1):
         return [SimpleNamespace(close=self.current_price)]
+
+    async def get_symbol_filters(self, symbol: str):
+        return self.filters if symbol == "BTCUSDT" else None
 
 
 class FakeJournal:
@@ -167,3 +178,41 @@ def test_reconcile_cleans_stale_ghost_position() -> None:
     assert "BTCUSDT" not in risk.open_positions
     assert journal.exits[-1]["exit_reason"] == "SL"
     assert journal.events[-1]["event_type"] == "RECONCILE_CLOSE"
+
+
+def test_execution_rejects_min_notional_filter_violation() -> None:
+    fake = FakeClient()
+    fake.filters = SymbolFilters(
+        symbol="BTCUSDT",
+        tick_size=Decimal("0.01"),
+        step_size=Decimal("0.0001"),
+        min_notional=Decimal("250"),
+        min_qty=Decimal("0.0001"),
+    )
+    engine = ExecutionEngine(fake, RiskManager())
+
+    result = run(engine.place_trade(plan()))
+
+    assert not result.accepted
+    assert result.reason and "Filter violation" in result.reason
+    assert fake.orders == []
+
+
+def test_execution_rounds_order_to_symbol_filters() -> None:
+    fake = FakeClient()
+    engine = ExecutionEngine(fake, RiskManager())
+    trade_plan = replace(
+        plan(),
+        quantity=Decimal("1.234567"),
+        entry_price=Decimal("100.009"),
+        sl_price=Decimal("97.009"),
+        tp1_price=Decimal("106.009"),
+    )
+
+    result = run(engine.place_trade(trade_plan))
+
+    assert result.accepted
+    assert fake.orders[0]["quantity"] == "1.2345"
+    assert fake.orders[0]["price"] == "100"
+    if engine._monitor_task:
+        engine._monitor_task.cancel()

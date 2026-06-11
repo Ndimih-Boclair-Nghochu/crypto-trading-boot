@@ -12,7 +12,7 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def strong_indicators() -> dict:
+def strong_indicators(score: int = 80) -> dict:
     latest = {
         "ema_21": 110,
         "ema_50": 100,
@@ -28,11 +28,25 @@ def strong_indicators() -> dict:
     }
     return {
         "timeframes": {"1h": {"latest": latest}},
-        "confluence": {"score": 80, "direction": "LONG"},
+        "confluence": {"score": score, "direction": "LONG"},
     }
 
 
-def test_confidence_gate_approves_when_all_checks_pass_on_testnet() -> None:
+def test_confidence_gate_allows_degraded_news_mode_for_exceptional_setup() -> None:
+    gate = ConfidenceGate(Settings(use_testnet=True, confidence_threshold=0.70))
+    result = run(
+        gate.passes(
+            LSTMSignal("LONG", 0.95, {"LONG": 0.95, "SHORT": 0.03, "NO_TRADE": 0.02}),
+            RLDecision("BUY", 0.95),
+            strong_indicators(95),
+            "BTCUSDT",
+        )
+    )
+    assert result.approved
+    assert result.indicator_agreement >= 4
+
+
+def test_confidence_gate_blocks_missing_calendar_without_exceptional_confidence() -> None:
     gate = ConfidenceGate(Settings(use_testnet=True, confidence_threshold=0.70))
     result = run(
         gate.passes(
@@ -42,8 +56,8 @@ def test_confidence_gate_approves_when_all_checks_pass_on_testnet() -> None:
             "BTCUSDT",
         )
     )
-    assert result.approved
-    assert result.indicator_agreement >= 4
+    assert not result.approved
+    assert any("major news window" in reason for reason in result.reasons)
 
 
 def test_confidence_gate_blocks_live_without_calendar_api() -> None:

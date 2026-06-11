@@ -67,7 +67,13 @@ class ConfidenceGate:
         if agreement < 4:
             reasons.append(f"only {agreement} independent indicators agree")
 
-        if await self._major_news_window(symbol):
+        exceptional_confidence = (
+            lstm_signal.confidence >= 0.90
+            and rl_decision.confidence >= 0.90
+            and float(confluence.get("score", 0) or 0) >= 90
+            and rl_decision.action == expected_action
+        )
+        if await self._major_news_window(symbol, allow_degraded=exceptional_confidence):
             reasons.append("major news window within 30 minutes")
 
         if bool(primary.get("atr_spike")):
@@ -112,14 +118,24 @@ class ConfidenceGate:
         ]
         return sum(bool(item) for item in checks)
 
-    async def _major_news_window(self, symbol: str) -> bool:
-        if not self.settings.economic_calendar_api_url:
-            return self.settings.require_economic_calendar or not self.settings.use_testnet
+    async def _major_news_window(self, symbol: str, allow_degraded: bool = False) -> bool:
         now = datetime.now(UTC)
-        if self._events_loaded_at and now - self._events_loaded_at < timedelta(minutes=15):
+        if not self.settings.economic_calendar_api_url:
+            logger.warning(
+                f"Economic calendar URL missing for {symbol}; "
+                f"{'allowing degraded high-confidence trade' if allow_degraded else 'blocking non-exceptional setup'}"
+            )
+            return not allow_degraded
+        if self._events_loaded_at and now - self._events_loaded_at < timedelta(hours=1):
             events = self._events_cache
         else:
             events = await self._fetch_events()
+            if events is None:
+                logger.warning(
+                    f"Economic calendar unavailable for {symbol}; "
+                    f"{'allowing degraded high-confidence trade' if allow_degraded else 'blocking non-exceptional setup'}"
+                )
+                return not allow_degraded
             self._events_cache = events
             self._events_loaded_at = now
         for event in events:
@@ -132,7 +148,7 @@ class ConfidenceGate:
                 continue
         return False
 
-    async def _fetch_events(self) -> list[dict[str, Any]]:
+    async def _fetch_events(self) -> list[dict[str, Any]] | None:
         try:
             if aiohttp:
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
@@ -147,7 +163,7 @@ class ConfidenceGate:
                 return payload
         except Exception as exc:
             logger.warning(f"Economic calendar fetch failed: {exc}")
-        return [{"time": datetime.now(UTC).isoformat(), "impact": "MAJOR"}] if self.settings.require_economic_calendar else []
+        return None
 
 
 def _gt(left: Any, right: Any) -> bool:
