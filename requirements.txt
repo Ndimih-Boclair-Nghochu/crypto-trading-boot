@@ -2,6 +2,7 @@ aiohttp>=3.9
 alembic>=1.13
 APScheduler>=3.10
 asyncpg>=0.29
+psycopg2-binary>=2.9
 ccxt>=4.3
 gymnasium>=0.29
 loguru>=0.7
