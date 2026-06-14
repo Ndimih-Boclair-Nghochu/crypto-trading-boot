@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -320,44 +319,6 @@ def _nearest_level(levels: list[Any], below: bool, price: Any) -> Decimal | None
         return None
 
 
-async def _run_health_server(system: TradingSystem) -> None:
-    """Bind a minimal HTTP server so Render's port scan succeeds.
-
-    This bot is a long-running background process with nothing to serve
-    over HTTP, but Render's "Web Service" type requires the process to bind
-    to $PORT or the deploy is killed after a port-scan timeout. If deployed
-    as a "Background Worker" this server is unnecessary but harmless.
-    """
-    from aiohttp import web
-
-    async def health(_request: web.Request) -> web.Response:
-        status = "PAUSED"
-        try:
-            state_path = settings.trading_state_path
-            if state_path.exists():
-                status = json.loads(state_path.read_text(encoding="utf-8")).get("status", "UNKNOWN")
-        except Exception:
-            status = "UNKNOWN"
-        return web.json_response(
-            {
-                "status": status,
-                "binance_connected": system.client.connected,
-                "testnet": settings.use_testnet,
-            }
-        )
-
-    app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", "8080"))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logger.info(f"Health check server listening on 0.0.0.0:{port}")
-
-
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["run", "migrate", "download_data", "train_models"], default="run")
@@ -369,9 +330,7 @@ async def main() -> None:
     elif args.mode == "train_models":
         await train_models()
     else:
-        system = TradingSystem()
-        await _run_health_server(system)
-        await system.main_loop()
+        await TradingSystem().main_loop()
 
 
 if __name__ == "__main__":

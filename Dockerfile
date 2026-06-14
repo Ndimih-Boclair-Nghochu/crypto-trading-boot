@@ -17,6 +17,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
-RUN mkdir -p logs models/weights .runtime
+RUN mkdir -p logs models/weights .runtime \
+    && chmod +x entrypoint.sh
 
-CMD ["python", "main.py"]
+CMD ["./entrypoint.sh"]
