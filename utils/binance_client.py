@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -115,14 +116,34 @@ class ResilientBinanceClient:
             if aiohttp and self.session is None:
                 self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
             if AsyncClient and self.client is None:
-                self.client = await AsyncClient.create(
+                # NOTE: We deliberately avoid AsyncClient.create(), which performs
+                # an *unconditional* ping against api.binance.com during
+                # construction -- even when testnet=True -- and raises if that
+                # call fails (e.g. "Service unavailable from a restricted
+                # location" on hosts whose IPs Binance blocks). That exception
+                # would otherwise propagate out of initialize() and crash the
+                # whole process on startup. Instead, build the client directly,
+                # point it at the correct base URL up front, and probe
+                # connectivity ourselves via the already-resilient ping()/
+                # update_exchange_info() below.
+                self.client = AsyncClient(
                     api_key=self.settings.binance_api_key,
                     api_secret=self.settings.binance_secret,
                     testnet=self.settings.use_testnet,
                 )
-                if self.settings.use_testnet:
-                    self.client.API_URL = self.settings.binance_spot_base_url + "/api"
+                self.client.API_URL = self.settings.binance_spot_base_url + "/api"
+                try:
+                    server_time = await self.client.get_server_time()
+                    self.client.timestamp_offset = server_time["serverTime"] - int(time.time() * 1000)
+                except Exception as exc:
+                    logger.warning(f"Could not sync Binance server time: {exc}")
             self.connected = await self.ping()
+            if not self.connected:
+                logger.warning(
+                    "Binance API is unreachable at startup; continuing in disconnected "
+                    "mode. The health check loop will retry and trading will resume "
+                    "once connectivity is restored."
+                )
             await self.update_exchange_info()
 
     async def close(self) -> None:
