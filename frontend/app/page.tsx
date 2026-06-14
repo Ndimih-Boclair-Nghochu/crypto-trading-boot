@@ -184,7 +184,7 @@ export default function Page() {
           <span className={`switch__track ${health?.trading_enabled ? "switch__track--on" : ""}`}>
             <span className="switch__thumb" />
           </span>
-          {health?.trading_enabled ? "TRADING ON" : "TRADING OFF"}
+          {toggling ? "UPDATING…" : health?.trading_enabled ? "TRADING ON" : "TRADING OFF"}
         </button>
       </div>
 

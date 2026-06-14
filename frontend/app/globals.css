@@ -410,3 +410,61 @@ input:focus-visible {
     animation: none;
   }
 }
+
+/* ---------- Responsive (mobile) ---------- */
+
+@media (max-width: 640px) {
+  .shell {
+    padding: 0 14px 48px;
+  }
+
+  .ticker {
+    flex-wrap: wrap;
+    white-space: normal;
+    overflow-x: visible;
+    row-gap: 8px;
+    padding: 10px 14px;
+  }
+
+  .ticker__spacer {
+    display: none;
+  }
+
+  .ticker__toggle {
+    order: 99;
+    flex-basis: 100%;
+    justify-content: center;
+    padding: 8px 12px;
+  }
+
+  .page-head {
+    padding: 20px 0 14px;
+  }
+
+  .page-head h1 {
+    font-size: 21px;
+  }
+
+  .grid,
+  .grid--two {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+
+  .card {
+    padding: 14px;
+  }
+
+  .metric__value {
+    font-size: 20px;
+  }
+
+  table {
+    font-size: 12px;
+  }
+
+  th,
+  td {
+    padding: 6px 8px;
+  }
+}
