@@ -132,7 +132,7 @@ export default function Page() {
     ? "ticker__dot--live"
     : "ticker__dot--paused";
 
-  const watchlist =
+  const watchlist: Array<Partial<Overview["no_trade"][number]> & { symbol: string }> =
     noTrade.length > 0
       ? Object.values(
           noTrade.reduce<Record<string, Overview["no_trade"][number]>>((acc, row) => {
