@@ -7,8 +7,7 @@ gymnasium>=0.29
 loguru>=0.7
 nest_asyncio>=1.6
 numpy<2.0
-pandas>=2.2
-pandas-ta>=0.4.71b0
+pandas>=2.2,<3.0
 python-binance>=1.0
 python-dotenv>=1.0
 requests>=2.31
