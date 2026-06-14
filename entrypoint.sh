@@ -5,28 +5,37 @@
 #
 # The API binds to $PORT (set by Render) so it satisfies the platform's
 # port-scan requirement and is what a separately-deployed frontend (e.g. on
-# Vercel) talks to. The trading bot has no HTTP interface and runs as a
-# background process.
-set -euo pipefail
+# Vercel) talks to.
+#
+# The trading bot is supervised in a restart loop: if it crashes (bad API
+# keys, transient network errors, etc.) it is relaunched automatically after
+# a short delay, WITHOUT taking down the API/dashboard. This keeps the
+# dashboard reachable (and able to show what went wrong) even while the bot
+# is recovering.
+set -uo pipefail
 
 PORT="${PORT:-8000}"
 
-echo "Starting trading bot (main.py)..."
-python main.py &
-BOT_PID=$!
+supervise_bot() {
+    while true; do
+        echo "Starting trading bot (main.py)..."
+        python main.py
+        EXIT_CODE=$?
+        echo "Trading bot exited with code ${EXIT_CODE}; restarting in 10s..."
+        sleep 10
+    done
+}
 
-echo "Starting API (uvicorn) on 0.0.0.0:${PORT}..."
-uvicorn api.server:app --host 0.0.0.0 --port "${PORT}" &
-API_PID=$!
+supervise_bot &
+BOT_SUPERVISOR_PID=$!
 
-# If either process exits, bring down the whole container so the platform
-# restarts it (and the other process) cleanly.
 terminate() {
-    kill "${BOT_PID}" "${API_PID}" 2>/dev/null || true
+    kill "${BOT_SUPERVISOR_PID}" 2>/dev/null || true
 }
 trap terminate TERM INT
 
-wait -n "${BOT_PID}" "${API_PID}"
-EXIT_CODE=$?
+echo "Starting API (uvicorn) on 0.0.0.0:${PORT}..."
+uvicorn api.server:app --host 0.0.0.0 --port "${PORT}"
+API_EXIT_CODE=$?
 terminate
-exit "${EXIT_CODE}"
+exit "${API_EXIT_CODE}"

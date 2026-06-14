@@ -46,7 +46,17 @@ def _write_state(state: dict[str, Any]) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db = Database()
-    await db.initialize()
+    try:
+        await db.initialize()
+    except Exception as exc:  # pragma: no cover
+        # Don't let a DB connectivity issue prevent the API (and /api/health)
+        # from starting at all -- /api/overview will surface this as a 503
+        # via the try/except below, but the rest of the API stays usable.
+        from utils.logger import logger as _logger
+
+        _logger.error(f"API: database initialization failed: {exc}")
+        db.pool = None
+        db.engine = None
     app.state.db = db
     try:
         yield
@@ -63,7 +73,7 @@ _origins = [o.strip() for o in os.getenv("FRONTEND_ORIGIN", "*").split(",") if o
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins or ["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
