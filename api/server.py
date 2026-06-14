@@ -84,6 +84,7 @@ def _db(app_: FastAPI) -> Database:
 
 
 @app.get("/")
+@app.head("/")
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     state = _read_json(STATE_PATH, {"trading_enabled": False, "status": "PAUSED"})
