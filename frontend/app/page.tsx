@@ -38,17 +38,29 @@ export default function Page() {
   const [riskDraft, setRiskDraft] = useState<RiskSettings | null>(null);
   const [now, setNow] = useState(new Date());
   const [error, setError] = useState<string | null>(null);
+  const [missedPolls, setMissedPolls] = useState(0);
   const [toggling, setToggling] = useState(false);
   const [savingRisk, setSavingRisk] = useState(false);
 
   const refresh = useCallback(async () => {
-    try {
-      const [h, o] = await Promise.all([api.health(), api.overview()]);
-      setHealth(h);
-      setOverview(o);
+    const results = await Promise.allSettled([api.health(), api.overview()]);
+    const [healthResult, overviewResult] = results;
+
+    if (healthResult.status === "fulfilled") setHealth(healthResult.value);
+    if (overviewResult.status === "fulfilled") setOverview(overviewResult.value);
+
+    if (healthResult.status === "rejected" || overviewResult.status === "rejected") {
+      setMissedPolls((n) => n + 1);
+      const failed: unknown =
+        healthResult.status === "rejected"
+          ? healthResult.reason
+          : overviewResult.status === "rejected"
+          ? overviewResult.reason
+          : undefined;
+      setError(failed instanceof Error ? failed.message : "Unable to reach the trading API");
+    } else {
+      setMissedPolls(0);
       setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to reach the trading API");
     }
   }, []);
 
@@ -125,7 +137,7 @@ export default function Page() {
   const equityTrendPositive = sparkValues.length > 1 ? sparkValues[sparkValues.length - 1] >= sparkValues[0] : true;
 
   const status = health?.status ?? "—";
-  const connected = !error;
+  const connected = missedPolls < 2;
   const dotClass = !connected
     ? "ticker__dot--down"
     : health?.trading_enabled
@@ -180,7 +192,9 @@ export default function Page() {
         <header className="page-head">
           <h1>Account overview</h1>
           <p>Live status, positions, and risk controls for the autonomous trading bot.</p>
-          {error && <p className="footer-note down">{error} — retrying every {POLL_MS / 1000}s.</p>}
+          {!connected && error && (
+            <p className="footer-note down">{error} — retrying every {POLL_MS / 1000}s.</p>
+          )}
         </header>
 
         <section className="grid">
