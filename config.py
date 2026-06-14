@@ -47,6 +47,19 @@ def _csv(name: str, default: Iterable[str]) -> tuple[str, ...]:
     return tuple(part.strip().upper() for part in raw.split(",") if part.strip())
 
 
+def _database_url() -> str:
+    raw = os.getenv("DATABASE_URL", "postgresql+asyncpg://botuser:strongpassword@localhost:5432/crypto_bot")
+    # Hosting providers (Render, Heroku, etc.) inject DATABASE_URL using the
+    # plain "postgres://" or "postgresql://" scheme, which SQLAlchemy's async
+    # engine + asyncpg driver cannot use directly. Normalize the scheme so the
+    # same env var works without manual edits in the provider's dashboard.
+    if raw.startswith("postgres://"):
+        raw = "postgresql+asyncpg://" + raw[len("postgres://"):]
+    elif raw.startswith("postgresql://"):
+        raw = "postgresql+asyncpg://" + raw[len("postgresql://"):]
+    return raw
+
+
 @dataclass(frozen=True)
 class Settings:
     binance_api_key: str = field(default_factory=lambda: os.getenv("BINANCE_API_KEY", ""))
@@ -55,12 +68,7 @@ class Settings:
     live_trading_reviewed: bool = field(default_factory=lambda: _bool("LIVE_TRADING_REVIEWED", False))
     testnet_trade_count: int = field(default_factory=lambda: _int("TESTNET_TRADE_COUNT", 0))
 
-    database_url: str = field(
-        default_factory=lambda: os.getenv(
-            "DATABASE_URL",
-            "postgresql+asyncpg://botuser:strongpassword@localhost:5432/crypto_bot",
-        )
-    )
+    database_url: str = field(default_factory=_database_url)
 
     symbols: tuple[str, ...] = field(
         default_factory=lambda: _csv("SYMBOLS", ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "ADAUSDT"))
