@@ -36,7 +36,7 @@ export default function Page() {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [risk, setRisk] = useState<RiskSettings | null>(null);
   const [riskDraft, setRiskDraft] = useState<RiskSettings | null>(null);
-  const [now, setNow] = useState(new Date());
+  const [now, setNow] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [missedPolls, setMissedPolls] = useState(0);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -75,6 +75,7 @@ export default function Page() {
       })
       .catch(() => undefined);
     const dataTimer = setInterval(refresh, POLL_MS);
+    setNow(new Date());
     const clockTimer = setInterval(() => setNow(new Date()), 1000);
     return () => {
       clearInterval(dataTimer);
@@ -171,7 +172,7 @@ export default function Page() {
           {connected ? status : "API UNREACHABLE"}
         </span>
         <span className="ticker__item">
-          UTC <strong>{now.toISOString().slice(11, 19)}</strong>
+          UTC <strong>{now ? now.toISOString().slice(11, 19) : "--:--:--"}</strong>
         </span>
         <span className="ticker__item">
           EQUITY <strong>{fmt(totalEquity)}</strong>
