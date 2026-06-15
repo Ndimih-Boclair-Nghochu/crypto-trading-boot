@@ -229,12 +229,12 @@ class TradingSystem:
     def trading_enabled(self) -> bool:
         path = settings.trading_state_path
         if not path.exists():
-            return False
+            return True
         try:
             state = json.loads(path.read_text(encoding="utf-8"))
-            return bool(state.get("trading_enabled", False))
+            return bool(state.get("trading_enabled", True))
         except Exception:
-            return False
+            return True
 
     async def _set_status(self, status: str) -> None:
         path = settings.trading_state_path
@@ -243,7 +243,7 @@ class TradingSystem:
             state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         except Exception:
             state = {}
-        state.update({"trading_enabled": bool(state.get("trading_enabled", False)), "status": status, "updated_at": datetime.now(UTC).isoformat()})
+        state.update({"trading_enabled": bool(state.get("trading_enabled", True)), "status": status, "updated_at": datetime.now(UTC).isoformat()})
         path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 

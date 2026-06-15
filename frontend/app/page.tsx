@@ -39,6 +39,7 @@ export default function Page() {
   const [now, setNow] = useState(new Date());
   const [error, setError] = useState<string | null>(null);
   const [missedPolls, setMissedPolls] = useState(0);
+  const [actionError, setActionError] = useState<string | null>(null);
   const [toggling, setToggling] = useState(false);
   const [savingRisk, setSavingRisk] = useState(false);
 
@@ -84,11 +85,16 @@ export default function Page() {
   const handleToggle = async () => {
     if (!health) return;
     setToggling(true);
+    setActionError(null);
     try {
       const updated = await api.toggleTrading(!health.trading_enabled);
       setHealth((prev) => (prev ? { ...prev, ...updated } : updated));
-    } catch {
-      setError("Could not update trading state");
+    } catch (err) {
+      setActionError(
+        err instanceof Error
+          ? `Could not update trading state: ${err.message}`
+          : "Could not update trading state — check that the backend is reachable."
+      );
     } finally {
       setToggling(false);
     }
@@ -97,9 +103,10 @@ export default function Page() {
   const handleClose = async (symbol: string) => {
     try {
       await api.closePosition(symbol);
+      setActionError(null);
       refresh();
     } catch {
-      setError(`Could not request close for ${symbol}`);
+      setActionError(`Could not request close for ${symbol} — check that the backend is reachable.`);
     }
   };
 
@@ -109,8 +116,9 @@ export default function Page() {
     try {
       const saved = await api.saveRiskSettings(riskDraft);
       setRisk(saved);
+      setActionError(null);
     } catch {
-      setError("Could not save risk settings");
+      setActionError("Could not save risk settings — check that the backend is reachable.");
     } finally {
       setSavingRisk(false);
     }
@@ -192,6 +200,7 @@ export default function Page() {
         <header className="page-head">
           <h1>Account overview</h1>
           <p>Live status, positions, and risk controls for the autonomous trading bot.</p>
+          {actionError && <p className="footer-note down">{actionError}</p>}
           {!connected && error && (
             <p className="footer-note down">{error} — retrying every {POLL_MS / 1000}s.</p>
           )}

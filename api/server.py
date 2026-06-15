@@ -38,7 +38,7 @@ def _read_json(path: Any, default: dict[str, Any]) -> dict[str, Any]:
 
 
 def _write_state(state: dict[str, Any]) -> None:
-    STATE_PATH.parent.mkdir(exist_ok=True)
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     state["updated_at"] = datetime.now(UTC).isoformat()
     STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
@@ -87,11 +87,11 @@ def _db(app_: FastAPI) -> Database:
 @app.head("/")
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    state = _read_json(STATE_PATH, {"trading_enabled": False, "status": "PAUSED"})
+    state = _read_json(STATE_PATH, {"trading_enabled": True, "status": "ANALYZING"})
     db = _db(app)
     return {
-        "status": state.get("status", "PAUSED"),
-        "trading_enabled": bool(state.get("trading_enabled", False)),
+        "status": state.get("status", "ANALYZING"),
+        "trading_enabled": bool(state.get("trading_enabled", True)),
         "testnet": settings.use_testnet,
         "updated_at": state.get("updated_at"),
         "db_connected": db.sessionmaker is not None,
@@ -100,7 +100,7 @@ async def health() -> dict[str, Any]:
 
 @app.get("/api/state")
 async def get_state() -> dict[str, Any]:
-    return _read_json(STATE_PATH, {"trading_enabled": False, "status": "PAUSED"})
+    return _read_json(STATE_PATH, {"trading_enabled": True, "status": "ANALYZING"})
 
 
 class ToggleBody(BaseModel):
@@ -188,6 +188,6 @@ class RiskSettingsBody(BaseModel):
 @app.post("/api/risk-settings")
 async def save_risk_settings(body: RiskSettingsBody) -> dict[str, Any]:
     overrides = body.model_dump()
-    RISK_OVERRIDE_PATH.parent.mkdir(exist_ok=True)
+    RISK_OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
     RISK_OVERRIDE_PATH.write_text(json.dumps(overrides, indent=2), encoding="utf-8")
     return overrides
