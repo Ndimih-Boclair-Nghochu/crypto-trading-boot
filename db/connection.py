@@ -32,7 +32,6 @@ class Database:
         self.settings = cfg
         self.engine: AsyncEngine | None = None
         self.sessionmaker: async_sessionmaker[AsyncSession] | None = None
-        self.pool: Any | None = None
 
     async def initialize(self) -> None:
         if create_async_engine is None or asyncpg is None or make_url is None:
@@ -42,26 +41,14 @@ class Database:
             raise RuntimeError("DATABASE_URL must use postgresql+asyncpg; SQLite fallback is intentionally unsupported.")
         self.engine = create_async_engine(
             self.settings.database_url,
-            pool_size=5,
-            max_overflow=15,
+            pool_size=3,
+            max_overflow=2,
             pool_pre_ping=True,
             future=True,
         )
         self.sessionmaker = async_sessionmaker(self.engine, expire_on_commit=False)
-        url = make_url(self.settings.database_url)
-        self.pool = await asyncpg.create_pool(
-            user=url.username,
-            password=url.password,
-            database=url.database,
-            host=url.host,
-            port=url.port or 5432,
-            min_size=5,
-            max_size=20,
-        )
 
     async def close(self) -> None:
-        if self.pool:
-            await self.pool.close()
         if self.engine:
             await self.engine.dispose()
 

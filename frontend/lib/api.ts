@@ -5,6 +5,7 @@ export type TradingState = {
   trading_enabled: boolean;
   testnet: boolean;
   updated_at?: string | null;
+  db_connected?: boolean;
 };
 
 export type Trade = {
@@ -63,6 +64,7 @@ export type Overview = {
   performance: PerformanceRow[];
   no_trade: NoTradeRow[];
   symbols: string[];
+  db_connected?: boolean;
 };
 
 export type RiskSettings = {

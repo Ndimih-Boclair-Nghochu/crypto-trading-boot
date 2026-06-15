@@ -195,6 +195,18 @@ export default function Page() {
           {!connected && error && (
             <p className="footer-note down">{error} — retrying every {POLL_MS / 1000}s.</p>
           )}
+          {connected && health && health.db_connected === false && (
+            <p className="footer-note down">
+              Backend is reachable, but the database connection isn&rsquo;t established yet — trade
+              history, equity, and events will be empty until that recovers.
+            </p>
+          )}
+          {connected && health && !health.trading_enabled && (
+            <p className="footer-note" style={{ color: "var(--accent-amber)" }}>
+              Trading is currently OFF — the bot is connected and idle. Flip the switch above to
+              start market analysis and trading on {health.testnet ? "testnet" : "your live account"}.
+            </p>
+          )}
         </header>
 
         <section className="grid">

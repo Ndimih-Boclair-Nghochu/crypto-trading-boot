@@ -17,7 +17,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -55,8 +55,8 @@ async def lifespan(app: FastAPI):
         from utils.logger import logger as _logger
 
         _logger.error(f"API: database initialization failed: {exc}")
-        db.pool = None
         db.engine = None
+        db.sessionmaker = None
     app.state.db = db
     try:
         yield
@@ -88,11 +88,13 @@ def _db(app_: FastAPI) -> Database:
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
     state = _read_json(STATE_PATH, {"trading_enabled": False, "status": "PAUSED"})
+    db = _db(app)
     return {
         "status": state.get("status", "PAUSED"),
         "trading_enabled": bool(state.get("trading_enabled", False)),
         "testnet": settings.use_testnet,
         "updated_at": state.get("updated_at"),
+        "db_connected": db.sessionmaker is not None,
     }
 
 
@@ -128,28 +130,39 @@ async def request_close(body: CloseRequestBody) -> dict[str, Any]:
     return {"close_requests": closes}
 
 
+async def _safe_fetch_all(db: Database, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    try:
+        return await db.fetch_all(statement, params)
+    except Exception as exc:
+        from utils.logger import logger as _logger
+
+        _logger.warning(f"API: query failed, returning empty result: {exc}")
+        return []
+
+
 @app.get("/api/overview")
 async def overview() -> dict[str, Any]:
     db = _db(app)
-    try:
-        return {
-            "trades": await db.fetch_all("SELECT * FROM trades ORDER BY entry_time DESC LIMIT 50"),
-            "open_positions": await db.fetch_all("SELECT * FROM trades WHERE outcome = 'OPEN' ORDER BY entry_time DESC"),
-            "equity": await db.fetch_all("SELECT * FROM equity_snapshots ORDER BY captured_at DESC LIMIT 300"),
-            "events": await db.fetch_all("SELECT * FROM system_events ORDER BY occurred_at DESC LIMIT 100"),
-            "performance": await db.fetch_all(
-                """
-                SELECT strategy_name, regime, win_rate, total_trades, profit_factor, avg_r_multiple
-                FROM strategy_performance
-                ORDER BY updated_at DESC
-                LIMIT 50
-                """
-            ),
-            "no_trade": await db.fetch_all("SELECT * FROM no_trade_log ORDER BY logged_at DESC LIMIT 50"),
-            "symbols": list(settings.symbols),
-        }
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Database query failed: {exc}") from exc
+    return {
+        "trades": await _safe_fetch_all(db, "SELECT * FROM trades ORDER BY entry_time DESC LIMIT 50"),
+        "open_positions": await _safe_fetch_all(
+            db, "SELECT * FROM trades WHERE outcome = 'OPEN' ORDER BY entry_time DESC"
+        ),
+        "equity": await _safe_fetch_all(db, "SELECT * FROM equity_snapshots ORDER BY captured_at DESC LIMIT 300"),
+        "events": await _safe_fetch_all(db, "SELECT * FROM system_events ORDER BY occurred_at DESC LIMIT 100"),
+        "performance": await _safe_fetch_all(
+            db,
+            """
+            SELECT strategy_name, regime, win_rate, total_trades, profit_factor, avg_r_multiple
+            FROM strategy_performance
+            ORDER BY updated_at DESC
+            LIMIT 50
+            """,
+        ),
+        "no_trade": await _safe_fetch_all(db, "SELECT * FROM no_trade_log ORDER BY logged_at DESC LIMIT 50"),
+        "symbols": list(settings.symbols),
+        "db_connected": db.sessionmaker is not None,
+    }
 
 
 @app.get("/api/risk-settings")
