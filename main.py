@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -46,12 +47,37 @@ class TradingSystem:
     async def start(self) -> None:
         if not settings.use_testnet:
             settings.assert_live_trading_allowed()
+        self._reset_trading_state_on_start()
         await database.initialize()
         await database.run_migrations()
         await self.journal.start()
         await self.client.initialize()
         self.client.start_health_check()
         await self.journal.log_event("SYSTEM_START", "INFO", "Trading system started", {"testnet": settings.use_testnet})
+
+    @staticmethod
+    def _reset_trading_state_on_start() -> None:
+        """Default trading to ON the first time this container boots.
+
+        Render free instances restart often, and the bot supervisor (see
+        entrypoint.sh) restarts main.py on every crash. We only want to
+        force trading_enabled=True on a genuinely fresh deploy (no state
+        file yet) -- NOT on every bot restart within the same container
+        lifetime, which would otherwise silently overwrite a user's
+        dashboard toggle every time the bot crash-loops.
+        """
+        path = settings.trading_state_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            return
+        force_paused = os.getenv("FORCE_TRADING_PAUSED", "").strip().lower() in {"1", "true", "yes"}
+        enabled = not force_paused
+        state = {
+            "trading_enabled": enabled,
+            "status": "ANALYZING" if enabled else "PAUSED",
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+        path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
     async def stop(self) -> None:
         await self.journal.log_event("SYSTEM_STOP", "INFO", "Trading system stopped", {})

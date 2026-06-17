@@ -109,7 +109,7 @@ class ToggleBody(BaseModel):
 
 @app.post("/api/state/toggle")
 async def toggle_trading(body: ToggleBody) -> dict[str, Any]:
-    state = _read_json(STATE_PATH, {})
+    state = _read_json(STATE_PATH, {"trading_enabled": True, "status": "ANALYZING"})
     state["trading_enabled"] = body.enabled
     state["status"] = "ANALYZING" if body.enabled else "PAUSED"
     _write_state(state)
@@ -122,7 +122,7 @@ class CloseRequestBody(BaseModel):
 
 @app.post("/api/state/close-position")
 async def request_close(body: CloseRequestBody) -> dict[str, Any]:
-    state = _read_json(STATE_PATH, {})
+    state = _read_json(STATE_PATH, {"trading_enabled": True, "status": "ANALYZING"})
     closes = state.get("close_requests", [])
     closes.append(body.symbol)
     state["close_requests"] = closes
