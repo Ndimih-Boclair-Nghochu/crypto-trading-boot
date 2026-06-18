@@ -288,6 +288,37 @@ export default function Page() {
           </div>
         </section>
 
+        <section className="grid">
+          <div className="card" style={{ gridColumn: "1 / -1" }}>
+            <h2>Why isn&rsquo;t the bot trading?</h2>
+            {noTrade.length === 0 ? (
+              <p className="empty">
+                No analysis has been logged yet. Once the bot completes its first cycle, an
+                explanation will appear here for every symbol it decided not to trade.
+              </p>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                {Object.values(
+                  noTrade.reduce<Record<string, Overview["no_trade"][number]>>((acc, row) => {
+                    if (!acc[row.symbol]) acc[row.symbol] = row;
+                    return acc;
+                  }, {})
+                ).map((row) => (
+                  <div key={row.symbol} style={{ borderBottom: "1px solid var(--border)", paddingBottom: 12 }}>
+                    <div className="row" style={{ marginBottom: 4 }}>
+                      <strong style={{ fontFamily: "var(--mono)" }}>{row.symbol}</strong>
+                      <span className="footer-note">{fmtTime(row.logged_at)}</span>
+                    </div>
+                    <p style={{ margin: 0, fontSize: 13, lineHeight: 1.5, color: "var(--text)" }}>
+                      {row.analysis_notes ?? `Blocked: ${row.gate_failed ?? "no specific reason recorded"}.`}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
+
         <section className="grid--two">
           <div className="card">
             <h2>Trade history</h2>

@@ -55,6 +55,8 @@ export type NoTradeRow = {
   lstm_confidence?: number | string;
   confluence_score?: number | string;
   gate_failed?: string;
+  gate_reasons?: string[];
+  analysis_notes?: string;
   logged_at?: string;
 };
 

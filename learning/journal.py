@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+from analysis.narrative import build_no_trade_narrative
 from db.connection import Database, database
 from trading.risk_manager import TradePlan
 from trading.strategy_engine import TradeSignal
@@ -250,25 +251,57 @@ class Journal:
 
     async def _write_no_trade(self, payload: dict[str, Any]) -> None:
         signal: TradeSignal = payload["signal"]
-        await self.db.execute(
-            """
-            INSERT INTO no_trade_log (
-                symbol, logged_at, regime, lstm_confidence, confluence_score, gate_failed, indicator_state
-            ) VALUES (
-                :symbol, :logged_at, :regime, :lstm_confidence, :confluence_score, :gate_failed,
-                CAST(:indicator_state AS JSONB)
-            )
-            """,
-            {
-                "symbol": signal.symbol,
-                "logged_at": payload["logged_at"],
-                "regime": signal.regime_at_entry,
-                "lstm_confidence": signal.lstm_confidence,
-                "confluence_score": signal.confluence_score,
-                "gate_failed": payload["gate_failed"][:100],
-                "indicator_state": json.dumps(_jsonable(signal.indicator_state)),
-            },
+        gate_reasons = list(getattr(signal, "reasons", []) or [payload["gate_failed"]])
+        narrative = build_no_trade_narrative(
+            symbol=signal.symbol,
+            regime=signal.regime_at_entry,
+            lstm_confidence=signal.lstm_confidence,
+            confluence_score=signal.confluence_score,
+            reasons=gate_reasons,
         )
+        params = {
+            "symbol": signal.symbol,
+            "logged_at": payload["logged_at"],
+            "regime": signal.regime_at_entry,
+            "lstm_confidence": signal.lstm_confidence,
+            "confluence_score": signal.confluence_score,
+            "gate_failed": payload["gate_failed"][:100],
+            "indicator_state": json.dumps(_jsonable(signal.indicator_state)),
+            "gate_reasons": json.dumps(gate_reasons),
+            "analysis_notes": narrative,
+        }
+        try:
+            await self.db.execute(
+                """
+                INSERT INTO no_trade_log (
+                    symbol, logged_at, regime, lstm_confidence, confluence_score, gate_failed,
+                    indicator_state, gate_reasons, analysis_notes
+                ) VALUES (
+                    :symbol, :logged_at, :regime, :lstm_confidence, :confluence_score, :gate_failed,
+                    CAST(:indicator_state AS JSONB), CAST(:gate_reasons AS JSONB), :analysis_notes
+                )
+                """,
+                params,
+            )
+        except Exception as exc:
+            # Falls back to the original columns only, in case this is
+            # running against a database that hasn't been migrated to
+            # 0002_no_trade_analysis_notes yet.
+            logger.warning(f"no_trade_log insert with analysis_notes failed, retrying without it: {exc}")
+            await self.db.execute(
+                """
+                INSERT INTO no_trade_log (
+                    symbol, logged_at, regime, lstm_confidence, confluence_score, gate_failed, indicator_state
+                ) VALUES (
+                    :symbol, :logged_at, :regime, :lstm_confidence, :confluence_score, :gate_failed,
+                    CAST(:indicator_state AS JSONB)
+                )
+                """,
+                {k: v for k, v in params.items() if k in {
+                    "symbol", "logged_at", "regime", "lstm_confidence", "confluence_score",
+                    "gate_failed", "indicator_state",
+                }},
+            )
 
     async def _write_equity(self, payload: dict[str, Any]) -> None:
         await self.db.execute(

@@ -80,6 +80,8 @@ if DeclarativeBase is not object:
         confluence_score: Mapped[float | None] = mapped_column(Numeric(5, 2))
         gate_failed: Mapped[str] = mapped_column(String(100), nullable=False)
         indicator_state: Mapped[dict | None] = mapped_column(JSONB)
+        gate_reasons: Mapped[list | None] = mapped_column(JSONB)
+        analysis_notes: Mapped[str | None] = mapped_column(Text)
 
 
     class StrategyPerformance(Base):
