@@ -40,7 +40,6 @@ export default function Page() {
   const [error, setError] = useState<string | null>(null);
   const [missedPolls, setMissedPolls] = useState(0);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [toggling, setToggling] = useState(false);
   const [savingRisk, setSavingRisk] = useState(false);
 
   const refresh = useCallback(async () => {
@@ -83,34 +82,6 @@ export default function Page() {
     };
   }, [refresh]);
 
-  const handleToggle = async () => {
-    if (!health) return;
-    setToggling(true);
-    setActionError(null);
-    try {
-      const updated = await api.toggleTrading(!health.trading_enabled);
-      setHealth((prev) => (prev ? { ...prev, ...updated } : updated));
-    } catch (err) {
-      setActionError(
-        err instanceof Error
-          ? `Could not update trading state: ${err.message}`
-          : "Could not update trading state — check that the backend is reachable."
-      );
-    } finally {
-      setToggling(false);
-    }
-  };
-
-  const handleClose = async (symbol: string) => {
-    try {
-      await api.closePosition(symbol);
-      setActionError(null);
-      refresh();
-    } catch {
-      setActionError(`Could not request close for ${symbol} — check that the backend is reachable.`);
-    }
-  };
-
   const handleSaveRisk = async () => {
     if (!riskDraft) return;
     setSavingRisk(true);
@@ -147,11 +118,8 @@ export default function Page() {
 
   const status = health?.status ?? "—";
   const connected = missedPolls < 2;
-  const dotClass = !connected
-    ? "ticker__dot--down"
-    : health?.trading_enabled
-    ? "ticker__dot--live"
-    : "ticker__dot--paused";
+  const isError = connected && (status === "ERROR" || status === "UNRESPONSIVE");
+  const dotClass = !connected ? "ticker__dot--down" : isError ? "ticker__dot--down" : status === "ANALYZING" ? "ticker__dot--live" : "ticker__dot--paused";
 
   const watchlist: Array<Partial<Overview["no_trade"][number]> & { symbol: string }> =
     noTrade.length > 0
@@ -181,26 +149,20 @@ export default function Page() {
         <span className="ticker__item">
           {health?.testnet ? <span className="badge badge--amber">TESTNET</span> : <span className="badge badge--green">LIVE</span>}
         </span>
+        <span className="ticker__item">
+          {connected && health?.binance_connected ? (
+            <span className="badge badge--green">BINANCE CONNECTED</span>
+          ) : (
+            <span className="badge badge--red">BINANCE DISCONNECTED</span>
+          )}
+        </span>
         <span className="ticker__spacer" />
-        <button
-          type="button"
-          className="switch ticker__toggle"
-          onClick={handleToggle}
-          disabled={!health || toggling}
-          aria-disabled={!health || toggling}
-          aria-pressed={!!health?.trading_enabled}
-        >
-          <span className={`switch__track ${health?.trading_enabled ? "switch__track--on" : ""}`}>
-            <span className="switch__thumb" />
-          </span>
-          {toggling ? "UPDATING…" : health?.trading_enabled ? "TRADING ON" : "TRADING OFF"}
-        </button>
       </div>
 
       <div className="shell">
         <header className="page-head">
           <h1>Account overview</h1>
-          <p>Live status, positions, and risk controls for the autonomous trading bot.</p>
+          <p>Live status, positions, and risk controls for the autonomous trading bot. The bot trades continuously and has no manual on/off switch.</p>
           {actionError && <p className="footer-note down">{actionError}</p>}
           {!connected && error && (
             <p className="footer-note down">{error} — retrying every {POLL_MS / 1000}s.</p>
@@ -211,10 +173,22 @@ export default function Page() {
               history, equity, and events will be empty until that recovers.
             </p>
           )}
-          {connected && health && !health.trading_enabled && (
+          {connected && health && !health.binance_connected && status !== "STARTING" && (
+            <p className="footer-note down">
+              Not connected to Binance{health.testnet ? " testnet" : ""} right now
+              {health.reason ? `: ${health.reason}` : ". Retrying automatically."}
+            </p>
+          )}
+          {connected && status === "STARTING" && (
             <p className="footer-note" style={{ color: "var(--accent-amber)" }}>
-              Trading is currently OFF — the bot is connected and idle. Flip the switch above to
-              start market analysis and trading on {health.testnet ? "testnet" : "your live account"}.
+              Starting up — connecting to the database and Binance{health?.testnet ? " testnet" : ""}.
+            </p>
+          )}
+          {connected && (status === "ERROR" || status === "UNRESPONSIVE") && (
+            <p className="footer-note down">
+              {status === "UNRESPONSIVE"
+                ? "The trading process hasn't reported in over 2 minutes — it may have crashed and is being restarted automatically."
+                : `The trading process hit an error${health?.reason ? `: ${health.reason}` : ""}. It will retry automatically.`}
             </p>
           )}
         </header>
@@ -261,7 +235,6 @@ export default function Page() {
                       <th>TP1</th>
                       <th>Qty</th>
                       <th>Opened</th>
-                      <th></th>
                     </tr>
                   </thead>
                   <tbody>
@@ -274,11 +247,6 @@ export default function Page() {
                         <td>{fmt(p.tp1_price, 4)}</td>
                         <td>{fmt(p.quantity, 4)}</td>
                         <td>{fmtTime(p.entry_time)}</td>
-                        <td>
-                          <button type="button" className="btn btn--danger" onClick={() => handleClose(p.symbol)}>
-                            Close
-                          </button>
-                        </td>
                       </tr>
                     ))}
                   </tbody>

@@ -1,9 +1,10 @@
 # Crypto Trading Desk — Frontend
 
 A Next.js dashboard for the trading bot's backend API (`/api` in the repo root,
-deployed on Render). Shows live status, open positions, equity, trade
-history, strategy performance, risk settings, and system events, and lets you
-toggle trading on/off.
+deployed on Render). Shows live status (including Binance and database
+connectivity), open positions, equity, trade history, strategy performance,
+risk settings, and system events. The bot trades continuously and has no
+manual on/off switch in this dashboard.
 
 ## Local development
 
@@ -34,9 +35,10 @@ serverless function).
 
 ## Backend CORS
 
-The FastAPI backend (`api/server.py`) reads `FRONTEND_ORIGIN` to set its
-allowed CORS origins. On Render, set:
-
-- `FRONTEND_ORIGIN` = `https://<your-vercel-app>.vercel.app`
-
-(comma-separate multiple origins if you also test from `http://localhost:3000`).
+The FastAPI backend (`api/server.py`) allows all origins (`*`) unconditionally.
+This API is read-mostly (status, trades, equity, risk settings) with no
+authentication or destructive actions, so there's no security reason to
+restrict the origin — and making it depend on an env var matching the exact
+Vercel URL was a real failure mode in practice (a missing or mismatched
+`FRONTEND_ORIGIN` silently blocked every request with no clear error). No
+CORS-related environment variable needs to be set on Render.

@@ -2,8 +2,10 @@ export const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000
 
 export type TradingState = {
   status: string;
+  reason?: string | null;
   trading_enabled: boolean;
   testnet: boolean;
+  binance_connected?: boolean;
   updated_at?: string | null;
   db_connected?: boolean;
 };
@@ -91,16 +93,6 @@ export const api = {
   health: () => request<TradingState>("/api/health"),
   overview: () => request<Overview>("/api/overview"),
   riskSettings: () => request<RiskSettings>("/api/risk-settings"),
-  toggleTrading: (enabled: boolean) =>
-    request<TradingState>("/api/state/toggle", {
-      method: "POST",
-      body: JSON.stringify({ enabled }),
-    }),
-  closePosition: (symbol: string) =>
-    request<{ close_requests: string[] }>("/api/state/close-position", {
-      method: "POST",
-      body: JSON.stringify({ symbol }),
-    }),
   saveRiskSettings: (settings: RiskSettings) =>
     request<RiskSettings>("/api/risk-settings", {
       method: "POST",

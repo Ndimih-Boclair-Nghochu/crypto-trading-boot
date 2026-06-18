@@ -47,37 +47,13 @@ class TradingSystem:
     async def start(self) -> None:
         if not settings.use_testnet:
             settings.assert_live_trading_allowed()
-        self._reset_trading_state_on_start()
+        await self._set_status("STARTING", reason="Connecting to database and Binance")
         await database.initialize()
         await database.run_migrations()
         await self.journal.start()
         await self.client.initialize()
         self.client.start_health_check()
         await self.journal.log_event("SYSTEM_START", "INFO", "Trading system started", {"testnet": settings.use_testnet})
-
-    @staticmethod
-    def _reset_trading_state_on_start() -> None:
-        """Default trading to ON the first time this container boots.
-
-        Render free instances restart often, and the bot supervisor (see
-        entrypoint.sh) restarts main.py on every crash. We only want to
-        force trading_enabled=True on a genuinely fresh deploy (no state
-        file yet) -- NOT on every bot restart within the same container
-        lifetime, which would otherwise silently overwrite a user's
-        dashboard toggle every time the bot crash-loops.
-        """
-        path = settings.trading_state_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            return
-        force_paused = os.getenv("FORCE_TRADING_PAUSED", "").strip().lower() in {"1", "true", "yes"}
-        enabled = not force_paused
-        state = {
-            "trading_enabled": enabled,
-            "status": "ANALYZING" if enabled else "PAUSED",
-            "updated_at": datetime.now(UTC).isoformat(),
-        }
-        path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
     async def stop(self) -> None:
         await self.journal.log_event("SYSTEM_STOP", "INFO", "Trading system stopped", {})
@@ -86,13 +62,17 @@ class TradingSystem:
         await database.close()
 
     async def main_loop(self) -> None:
-        await self.start()
+        try:
+            await self.start()
+        except Exception as exc:
+            logger.error(f"Startup failed: {exc}")
+            await self._set_status("ERROR", reason=f"Startup failed: {exc}")
+            raise
         try:
             while True:
                 try:
-                    await self._process_close_requests()
                     if not self.trading_enabled():
-                        await self._set_status("PAUSED")
+                        await self._set_status("PAUSED", reason="FORCE_TRADING_PAUSED is set")
                         await asyncio.sleep(5)
                         continue
 
@@ -198,6 +178,7 @@ class TradingSystem:
                 except Exception as exc:
                     logger.exception(f"Unexpected main loop error; sleeping then resuming: {exc}")
                     await self.journal.log_event("MAIN_LOOP_ERROR", "CRITICAL", str(exc), {})
+                    await self._set_status("ERROR", reason=str(exc))
                     await asyncio.sleep(60)
         finally:
             await self.stop()
@@ -235,41 +216,23 @@ class TradingSystem:
         except Exception as exc:
             logger.warning(f"Equity snapshot failed: {exc}")
 
-    async def _process_close_requests(self) -> None:
-        state_path = settings.trading_state_path
-        if not state_path.exists():
-            return
-        try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            close_requests = [symbol for symbol in state.get("close_requests", []) if symbol]
-            for symbol in close_requests:
-                logger.info(f"Manual close request received for {symbol}")
-                await self.execution.emergency_close_symbol(symbol)
-                await self.journal.log_event("MANUAL_CLOSE", "INFO", f"Manual close triggered for {symbol}", {})
-            if close_requests:
-                state["close_requests"] = []
-                state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        except Exception as exc:
-            logger.warning(f"Close request processing failed: {exc}")
-
     def trading_enabled(self) -> bool:
-        path = settings.trading_state_path
-        if not path.exists():
-            return True
-        try:
-            state = json.loads(path.read_text(encoding="utf-8"))
-            return bool(state.get("trading_enabled", True))
-        except Exception:
-            return True
+        # The system is always on. Kept as a method (rather than inlined
+        # 'True') so any future kill-switch (e.g. FORCE_TRADING_PAUSED for
+        # ops/incident response) has one obvious place to live.
+        return os.getenv("FORCE_TRADING_PAUSED", "").strip().lower() not in {"1", "true", "yes"}
 
-    async def _set_status(self, status: str) -> None:
+    async def _set_status(self, status: str, *, reason: str | None = None) -> None:
         path = settings.trading_state_path
-        path.parent.mkdir(exist_ok=True)
-        try:
-            state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        except Exception:
-            state = {}
-        state.update({"trading_enabled": bool(state.get("trading_enabled", True)), "status": status, "updated_at": datetime.now(UTC).isoformat()})
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            "trading_enabled": self.trading_enabled(),
+            "status": status,
+            "reason": reason,
+            "testnet": settings.use_testnet,
+            "binance_connected": bool(getattr(self.client, "connected", False)),
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
         path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 

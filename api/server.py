@@ -12,7 +12,6 @@ the running bot.
 from __future__ import annotations
 
 import json
-import os
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
@@ -35,12 +34,6 @@ def _read_json(path: Any, default: dict[str, Any]) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
-
-
-def _write_state(state: dict[str, Any]) -> None:
-    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    state["updated_at"] = datetime.now(UTC).isoformat()
-    STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
 @asynccontextmanager
@@ -66,13 +59,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Crypto Trading Desk API", lifespan=lifespan)
 
-# Allow the Vercel-hosted frontend (and local dev) to call this API.
-# Set FRONTEND_ORIGIN to a comma-separated list of allowed origins, e.g.
-# "https://your-app.vercel.app,http://localhost:3000"
-_origins = [o.strip() for o in os.getenv("FRONTEND_ORIGIN", "*").split(",") if o.strip()]
+# Wildcard CORS, unconditionally. This API exposes no secrets and no
+# authenticated/destructive actions (read-only status + data), so there is
+# no security reason to restrict the origin. Making this depend on a
+# FRONTEND_ORIGIN env var being set correctly on Render was a real failure
+# mode: if that var was missing, blank, or didn't exactly match the Vercel
+# URL, every browser request was silently blocked by CORS with no useful
+# error surfaced anywhere in the app itself.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_origins or ["*"],
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -87,47 +83,36 @@ def _db(app_: FastAPI) -> Database:
 @app.head("/")
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
-    state = _read_json(STATE_PATH, {"trading_enabled": True, "status": "ANALYZING"})
+    state = _read_json(STATE_PATH, {"trading_enabled": True, "status": "STARTING"})
     db = _db(app)
+
+    updated_at = state.get("updated_at")
+    stale = False
+    if updated_at:
+        try:
+            age_seconds = (datetime.now(UTC) - datetime.fromisoformat(updated_at)).total_seconds()
+            stale = age_seconds > 120
+        except Exception:
+            stale = False
+
+    status = state.get("status", "STARTING")
+    if stale and status not in {"ERROR"}:
+        status = "UNRESPONSIVE"
+
     return {
-        "status": state.get("status", "ANALYZING"),
+        "status": status,
+        "reason": state.get("reason"),
         "trading_enabled": bool(state.get("trading_enabled", True)),
         "testnet": settings.use_testnet,
-        "updated_at": state.get("updated_at"),
+        "binance_connected": bool(state.get("binance_connected", False)),
         "db_connected": db.sessionmaker is not None,
+        "updated_at": updated_at,
     }
 
 
 @app.get("/api/state")
 async def get_state() -> dict[str, Any]:
-    return _read_json(STATE_PATH, {"trading_enabled": True, "status": "ANALYZING"})
-
-
-class ToggleBody(BaseModel):
-    enabled: bool
-
-
-@app.post("/api/state/toggle")
-async def toggle_trading(body: ToggleBody) -> dict[str, Any]:
-    state = _read_json(STATE_PATH, {"trading_enabled": True, "status": "ANALYZING"})
-    state["trading_enabled"] = body.enabled
-    state["status"] = "ANALYZING" if body.enabled else "PAUSED"
-    _write_state(state)
-    return state
-
-
-class CloseRequestBody(BaseModel):
-    symbol: str
-
-
-@app.post("/api/state/close-position")
-async def request_close(body: CloseRequestBody) -> dict[str, Any]:
-    state = _read_json(STATE_PATH, {"trading_enabled": True, "status": "ANALYZING"})
-    closes = state.get("close_requests", [])
-    closes.append(body.symbol)
-    state["close_requests"] = closes
-    _write_state(state)
-    return {"close_requests": closes}
+    return _read_json(STATE_PATH, {"trading_enabled": True, "status": "STARTING"})
 
 
 async def _safe_fetch_all(db: Database, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
