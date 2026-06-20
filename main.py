@@ -54,6 +54,75 @@ class TradingSystem:
         await self.client.initialize()
         self.client.start_health_check()
         await self.journal.log_event("SYSTEM_START", "INFO", "Trading system started", {"testnet": settings.use_testnet})
+        await self._ensure_models_trained()
+
+    async def _ensure_models_trained(self) -> None:
+        """Train the LSTM and RL models on first run if no weights exist.
+
+        Without this, models/lstm_model.py and models/rl_agent.py silently
+        fall back to confidence=0.0 / action=HOLD whenever weights are
+        missing -- which the confidence gate then (correctly) refuses to
+        trade on, forever, with no error or crash. The system looked
+        "healthy" (connected, analyzing) while being structurally unable to
+        ever take a trade, because training was a separate manual CLI step
+        that was never run against this deployment.
+        """
+        weights_dir = settings.runtime_dir.parent / "models" / "weights"
+        lstm_missing = [s for s in settings.symbols if not (weights_dir / f"lstm_{s}.pt").exists()]
+        rl_missing = not (weights_dir / "ppo_trading_agent.zip").exists()
+        if not lstm_missing and not rl_missing:
+            logger.info("Model weights found for all symbols; skipping training bootstrap.")
+            return
+
+        logger.warning(
+            f"No trained weights found (missing LSTM for {lstm_missing or 'none'}, "
+            f"RL missing={rl_missing}). Bootstrapping training now -- this runs once and "
+            f"may take several minutes; the bot will not trade until it completes."
+        )
+
+        async def _heartbeat() -> None:
+            # Training can run far longer than the dashboard's 120s
+            # staleness window. Without this, a legitimate multi-minute
+            # training run gets misreported as UNRESPONSIVE even though
+            # the process is healthy and working.
+            while True:
+                await asyncio.sleep(45)
+                await self._set_status(
+                    "TRAINING",
+                    reason=(
+                        "Training the LSTM/RL models for the first time (one-time setup). "
+                        "This can take several minutes; the bot will start analyzing once it finishes."
+                    ),
+                )
+
+        await self._set_status(
+            "TRAINING",
+            reason=(
+                "No trained models found. Downloading historical data and training the LSTM/RL "
+                "models for the first time. This is a one-time step and may take several minutes."
+            ),
+        )
+        heartbeat_task = asyncio.create_task(_heartbeat())
+        try:
+            await download_data()
+            await train_models()
+            await self.journal.log_event(
+                "MODEL_TRAINING", "INFO", "Initial model training completed", {"symbols": list(settings.symbols)}
+            )
+            logger.info("Initial model training completed.")
+        except Exception as exc:
+            logger.exception(f"Initial model training failed: {exc}")
+            await self.journal.log_event("MODEL_TRAINING_FAILED", "CRITICAL", str(exc), {})
+            await self._set_status(
+                "ERROR",
+                reason=(
+                    f"Initial model training failed ({exc}). The bot cannot generate trade signals "
+                    "without trained models. Check Render logs for details."
+                ),
+            )
+            raise
+        finally:
+            heartbeat_task.cancel()
 
     async def stop(self) -> None:
         await self.journal.log_event("SYSTEM_STOP", "INFO", "Trading system stopped", {})
@@ -247,13 +316,16 @@ async def download_data() -> None:
     await client.initialize()
     end = datetime.now(UTC)
     start = end - timedelta(days=365 * 2)
-    for symbol in settings.symbols:
-        logger.info(f"Downloading two years of 1h data for {symbol}")
-        candles = await client.get_historical_ohlcv(symbol, "1h", int(start.timestamp() * 1000), int(end.timestamp() * 1000))
-        frame = pd.DataFrame([c.to_dict() for c in candles])
-        path = settings.runtime_dir / f"training_{symbol}_1h.csv"
-        frame.to_csv(path, index=False)
-        logger.info(f"Wrote {len(frame)} candles to {path}")
+    for i, symbol in enumerate(settings.symbols, start=1):
+        logger.info(f"[{i}/{len(settings.symbols)}] Downloading two years of 1h data for {symbol}")
+        try:
+            candles = await client.get_historical_ohlcv(symbol, "1h", int(start.timestamp() * 1000), int(end.timestamp() * 1000))
+            frame = pd.DataFrame([c.to_dict() for c in candles])
+            path = settings.runtime_dir / f"training_{symbol}_1h.csv"
+            frame.to_csv(path, index=False)
+            logger.info(f"Wrote {len(frame)} candles to {path}")
+        except Exception as exc:
+            logger.warning(f"Historical data download failed for {symbol}, skipping: {exc}")
     await client.close()
 
 
@@ -261,22 +333,27 @@ async def train_models() -> None:
     ta = TechnicalAnalysisEngine()
     lstm = LSTMModelService()
     rl_rows: list[dict[str, float]] = []
-    for symbol in settings.symbols:
+    for i, symbol in enumerate(settings.symbols, start=1):
         path = settings.runtime_dir / f"training_{symbol}_1h.csv"
         if not path.exists():
             logger.warning(f"Training file missing for {symbol}: run --mode=download_data first")
             continue
-        raw = pd.read_csv(path)
-        candles = [
-            _row_to_candle(symbol, "1h", row)
-            for _, row in raw.iterrows()
-            if float(row.get("volume", 0) or 0) > 0
-        ]
-        frame = enrich_indicators(candles_to_frame(candles)).replace([float("inf"), float("-inf")], pd.NA).ffill().bfill()
-        metrics = lstm.train(symbol, frame)
-        logger.info(f"LSTM metrics for {symbol}: {metrics}")
-        rl_rows.extend(frame.tail(2_000).to_dict(orient="records"))
+        try:
+            logger.info(f"[{i}/{len(settings.symbols)}] Training LSTM for {symbol}")
+            raw = pd.read_csv(path)
+            candles = [
+                _row_to_candle(symbol, "1h", row)
+                for _, row in raw.iterrows()
+                if float(row.get("volume", 0) or 0) > 0
+            ]
+            frame = enrich_indicators(candles_to_frame(candles)).replace([float("inf"), float("-inf")], pd.NA).ffill().bfill()
+            metrics = lstm.train(symbol, frame)
+            logger.info(f"LSTM metrics for {symbol}: {metrics}")
+            rl_rows.extend(frame.tail(2_000).to_dict(orient="records"))
+        except Exception as exc:
+            logger.warning(f"LSTM training failed for {symbol}, skipping: {exc}")
     if rl_rows:
+        logger.info(f"Training RL agent on {len(rl_rows)} rows")
         RLAgentService().train(rl_rows)
 
 

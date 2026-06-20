@@ -173,7 +173,7 @@ export default function Page() {
               history, equity, and events will be empty until that recovers.
             </p>
           )}
-          {connected && health && !health.binance_connected && status !== "STARTING" && (
+          {connected && health && !health.binance_connected && status !== "STARTING" && status !== "TRAINING" && (
             <p className="footer-note down">
               Not connected to Binance{health.testnet ? " testnet" : ""} right now
               {health.reason ? `: ${health.reason}` : ". Retrying automatically."}
@@ -182,6 +182,13 @@ export default function Page() {
           {connected && status === "STARTING" && (
             <p className="footer-note" style={{ color: "var(--accent-amber)" }}>
               Starting up — connecting to the database and Binance{health?.testnet ? " testnet" : ""}.
+            </p>
+          )}
+          {connected && status === "TRAINING" && (
+            <p className="footer-note" style={{ color: "var(--accent-amber)" }}>
+              One-time setup: training the LSTM/RL models on historical data
+              {health?.reason ? ` — ${health.reason}` : "."} This can take several minutes; the bot
+              will start analyzing automatically once it finishes.
             </p>
           )}
           {connected && (status === "ERROR" || status === "UNRESPONSIVE") && (

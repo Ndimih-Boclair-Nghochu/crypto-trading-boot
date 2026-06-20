@@ -121,21 +121,28 @@ class ConfidenceGate:
     async def _major_news_window(self, symbol: str, allow_degraded: bool = False) -> bool:
         now = datetime.now(UTC)
         if not self.settings.economic_calendar_api_url:
-            logger.warning(
-                f"Economic calendar URL missing for {symbol}; "
-                f"{'allowing degraded high-confidence trade' if allow_degraded else 'blocking non-exceptional setup'}"
-            )
-            return not allow_degraded
+            if self.settings.require_economic_calendar:
+                logger.warning(
+                    f"Economic calendar URL missing for {symbol} and REQUIRE_ECONOMIC_CALENDAR is "
+                    f"set; {'allowing degraded high-confidence trade' if allow_degraded else 'blocking setup'}"
+                )
+                return not allow_degraded
+            # No calendar feed configured and it isn't required: don't gate
+            # on news at all rather than silently vetoing every trade.
+            return False
         if self._events_loaded_at and now - self._events_loaded_at < timedelta(hours=1):
             events = self._events_cache
         else:
             events = await self._fetch_events()
             if events is None:
-                logger.warning(
-                    f"Economic calendar unavailable for {symbol}; "
-                    f"{'allowing degraded high-confidence trade' if allow_degraded else 'blocking non-exceptional setup'}"
-                )
-                return not allow_degraded
+                if self.settings.require_economic_calendar:
+                    logger.warning(
+                        f"Economic calendar unavailable for {symbol} and REQUIRE_ECONOMIC_CALENDAR is "
+                        f"set; {'allowing degraded high-confidence trade' if allow_degraded else 'blocking setup'}"
+                    )
+                    return not allow_degraded
+                logger.warning(f"Economic calendar unavailable for {symbol}; proceeding without news gating")
+                return False
             self._events_cache = events
             self._events_loaded_at = now
         for event in events:
