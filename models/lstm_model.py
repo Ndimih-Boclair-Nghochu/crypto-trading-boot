@@ -15,6 +15,17 @@ try:
     import torch
     from torch import nn
     from torch.utils.data import DataLoader, TensorDataset
+
+    # Render's instances are small, shared CPU containers. PyTorch defaults
+    # to spawning one intra-op thread per visible core, each with its own
+    # allocation overhead -- on a constrained instance this measurably adds
+    # to memory/CPU pressure for no real benefit (this model is small).
+    # Capping it here is one of the few concrete memory-reduction levers
+    # available without changing the model architecture.
+    try:
+        torch.set_num_threads(1)
+    except Exception:
+        pass
 except Exception as _torch_import_error:  # pragma: no cover
     torch = None
     nn = None

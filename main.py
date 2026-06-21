@@ -79,6 +79,7 @@ class TradingSystem:
             f"RL missing={rl_missing}). Bootstrapping training now -- this runs once and "
             f"may take several minutes; the bot will not trade until it completes."
         )
+        _log_memory("bootstrap start")
 
         async def _heartbeat() -> None:
             # Training can run far longer than the dashboard's 120s
@@ -346,13 +347,18 @@ async def download_data() -> None:
     end = datetime.now(UTC)
     start = end - timedelta(days=365 * 2)
     for i, symbol in enumerate(settings.symbols, start=1):
-        logger.info(f"[{i}/{len(settings.symbols)}] Downloading two years of 1h data for {symbol}")
+        logger.info(f"[{i}/{len(settings.symbols)}] Downloading up to 2 years of 1h data for {symbol} (testnet retains less)")
         try:
             candles = await client.get_historical_ohlcv(symbol, "1h", int(start.timestamp() * 1000), int(end.timestamp() * 1000))
             frame = pd.DataFrame([c.to_dict() for c in candles])
             path = settings.runtime_dir / f"training_{symbol}_1h.csv"
             frame.to_csv(path, index=False)
-            logger.info(f"Wrote {len(frame)} candles to {path}")
+            span = ""
+            if len(frame) and "open_time" in frame.columns:
+                first = datetime.fromtimestamp(frame["open_time"].iloc[0] / 1000, tz=UTC)
+                last = datetime.fromtimestamp(frame["open_time"].iloc[-1] / 1000, tz=UTC)
+                span = f" ({first.date()} to {last.date()})"
+            logger.info(f"Wrote {len(frame)} candles to {path}{span}")
         except Exception as exc:
             logger.warning(f"Historical data download failed for {symbol}, skipping: {exc}")
     await client.close()
@@ -360,6 +366,8 @@ async def download_data() -> None:
 
 async def train_models() -> None:
     from models.lstm_model import torch as _torch  # local import: reflects current module state
+
+    import gc
 
     ta = TechnicalAnalysisEngine()
     lstm = LSTMModelService()
@@ -376,6 +384,7 @@ async def train_models() -> None:
             continue
         try:
             logger.info(f"[{i}/{len(settings.symbols)}] Training LSTM for {symbol}")
+            _log_memory(f"before training {symbol}")
             raw = pd.read_csv(path)
             candles = [
                 _row_to_candle(symbol, "1h", row)
@@ -385,15 +394,41 @@ async def train_models() -> None:
             frame = enrich_indicators(candles_to_frame(candles)).replace([float("inf"), float("-inf")], pd.NA).ffill().bfill()
             metrics = lstm.train(symbol, frame)
             logger.info(f"LSTM metrics for {symbol}: {metrics}")
+            _log_memory(f"after training {symbol}")
             rl_rows.extend(frame.tail(2_000).to_dict(orient="records"))
         except Exception as exc:
             logger.warning(f"LSTM training failed for {symbol}, skipping: {exc}")
+        finally:
+            # Training is the heaviest sequential step in the bootstrap;
+            # release intermediate data/model memory before moving on to
+            # the next symbol rather than letting it accumulate across all 5.
+            raw = candles = frame = None
+            gc.collect()
     if rl_rows:
         logger.info(f"Training RL agent on {len(rl_rows)} rows")
         try:
             RLAgentService().train(rl_rows)
         except Exception as exc:
             logger.warning(f"RL agent training failed, continuing without it: {exc}")
+
+
+def _log_memory(label: str) -> None:
+    """Logs current process RSS memory, for diagnosing OOM kills.
+
+    A process killed by the OS for exceeding its memory limit (common on
+    small Render instances during PyTorch training) leaves no Python
+    traceback at all -- the container just silently restarts. This makes
+    that visible ahead of time by logging memory right before/after the
+    heaviest steps, so if it happens again the last logged value shows how
+    close to the limit the process actually was.
+    """
+    try:
+        import resource
+
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        logger.info(f"[memory] {label}: {rss_mb:.0f} MB RSS (peak)")
+    except Exception:
+        pass
 
 
 def _row_to_candle(symbol: str, timeframe: str, row: pd.Series) -> Any:
