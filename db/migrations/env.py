@@ -16,7 +16,19 @@ target_metadata = Base.metadata
 
 
 def get_url() -> str:
-    url = os.getenv("DATABASE_URL", config.get_main_option("sqlalchemy.url")).replace("+asyncpg", "")
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        ini_url = config.get_main_option("sqlalchemy.url")
+        if not ini_url:
+            raise RuntimeError(
+                "DATABASE_URL is not set (and alembic.ini has no sqlalchemy.url "
+                "fallback configured). Migrations cannot run without a real "
+                "database connection string. Set DATABASE_URL as an environment "
+                "variable / secret on whatever platform this is running on."
+            )
+        url = ini_url
+    else:
+        url = url.replace("+asyncpg", "")
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
     return url

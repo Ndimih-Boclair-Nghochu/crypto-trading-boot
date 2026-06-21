@@ -48,11 +48,30 @@ def _csv(name: str, default: Iterable[str]) -> tuple[str, ...]:
 
 
 def _database_url() -> str:
-    raw = os.getenv("DATABASE_URL", "postgresql+asyncpg://botuser:strongpassword@localhost:5432/crypto_bot")
-    # Hosting providers (Render, Heroku, etc.) inject DATABASE_URL using the
-    # plain "postgres://" or "postgresql://" scheme, which SQLAlchemy's async
-    # engine + asyncpg driver cannot use directly. Normalize the scheme so the
-    # same env var works without manual edits in the provider's dashboard.
+    raw = os.getenv("DATABASE_URL")
+    if not raw:
+        if _bool("ALLOW_LOCALHOST_DB_FALLBACK", False):
+            # Opt-in only, for genuine local development without a .env
+            # file. Never silently used in a real deployment: if
+            # DATABASE_URL is missing there, that's a misconfiguration that
+            # should fail loudly and immediately, not connect to a
+            # localhost Postgres that can never exist in a container.
+            return "postgresql+asyncpg://botuser:strongpassword@localhost:5432/crypto_bot"
+        raise RuntimeError(
+            "DATABASE_URL is not set. This must be configured as an environment "
+            "variable / secret on whatever platform this is running on:\n"
+            "  - Render: service -> Environment -> add DATABASE_URL\n"
+            "  - Fly.io: `fly secrets set DATABASE_URL=\"...\"` (then redeploy/restart "
+            "the machine -- secrets set on an already-running machine do not "
+            "retroactively apply until it restarts)\n"
+            "For local development only, set ALLOW_LOCALHOST_DB_FALLBACK=true to use "
+            "a localhost default instead of setting DATABASE_URL explicitly."
+        )
+    # Hosting providers (Render, Heroku, Fly, etc.) inject DATABASE_URL using
+    # the plain "postgres://" or "postgresql://" scheme, which SQLAlchemy's
+    # async engine + asyncpg driver cannot use directly. Normalize the scheme
+    # so the same env var works without manual edits in the provider's
+    # dashboard.
     if raw.startswith("postgres://"):
         raw = "postgresql+asyncpg://" + raw[len("postgres://"):]
     elif raw.startswith("postgresql://"):
