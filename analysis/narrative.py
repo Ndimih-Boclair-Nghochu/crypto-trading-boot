@@ -48,8 +48,9 @@ REGIME_RISK_NOTES: dict[str, str] = {
 # Maps substrings of ConfidenceGate's reason strings to a plain-English
 # explanation of what that specific check protects against.
 _REASON_EXPLANATIONS: list[tuple[str, str]] = [
-    ("LSTM output is NO_TRADE", "the price-direction model itself isn't predicting a clear long or short move"),
+    ("LSTM did not produce a tradeable signal", None),  # handled specially below: keep the detail verbatim
     ("LSTM confidence", "the price-direction model's confidence in any direction is too low to trust"),
+    ("LSTM output is NO_TRADE", "the price-direction model itself isn't predicting a clear long or short move"),
     ("RL action", "the reinforcement-learning execution model disagrees with the direction the price model suggests"),
     ("multi-timeframe confluence below", "not enough agreement across timeframes (1m-1d) to support a trade"),
     ("multi-timeframe direction contradicts", "shorter and longer timeframes are pointing in different directions"),
@@ -58,9 +59,24 @@ _REASON_EXPLANATIONS: list[tuple[str, str]] = [
     ("ATR is above", "current price swings (ATR) are abnormally large versus their recent average, making stop placement unreliable"),
 ]
 
+# Substrings that indicate a genuine operational problem (not just "the
+# market doesn't look great right now") -- these should be surfaced
+# verbatim rather than smoothed into generic language, since they mean the
+# model literally isn't running.
+_OPERATIONAL_ISSUE_MARKERS = (
+    "PyTorch unavailable",
+    "weights missing",
+    "insufficient sequence",
+)
+
 
 def explain_reason(reason: str) -> str:
+    for marker in _OPERATIONAL_ISSUE_MARKERS:
+        if marker in reason:
+            return f"the price-direction model isn't able to run right now ({marker})"
     for needle, explanation in _REASON_EXPLANATIONS:
+        if explanation is None:
+            continue
         if needle in reason:
             return explanation
     return reason

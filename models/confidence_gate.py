@@ -50,9 +50,13 @@ class ConfidenceGate:
         threshold = base_threshold * 0.85 if extreme_regime else base_threshold
 
         if direction not in {"LONG", "SHORT"}:
-            reasons.append("LSTM output is NO_TRADE")
+            if lstm_signal.reason:
+                reasons.append(f"LSTM did not produce a tradeable signal ({lstm_signal.reason})")
+            else:
+                reasons.append("LSTM output is NO_TRADE")
         if lstm_signal.confidence < threshold:
-            reasons.append(f"LSTM confidence {lstm_signal.confidence:.2f} below {threshold:.2f}")
+            suffix = f" ({lstm_signal.reason})" if lstm_signal.reason and lstm_signal.confidence == 0.0 else ""
+            reasons.append(f"LSTM confidence {lstm_signal.confidence:.2f} below {threshold:.2f}{suffix}")
 
         expected_action = "BUY" if direction == "LONG" else "SELL"
         if rl_decision.action != expected_action:
