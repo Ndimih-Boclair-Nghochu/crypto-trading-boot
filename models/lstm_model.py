@@ -59,6 +59,16 @@ INDEX_TO_SIGNAL = {0: "LONG", 1: "SHORT", 2: "NO_TRADE"}
 SIGNAL_TO_INDEX = {value: key for key, value in INDEX_TO_SIGNAL.items()}
 
 
+def _log_memory_checkpoint(label: str) -> None:
+    try:
+        import resource
+
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        logger.info(f"[memory] {label}: {rss_mb:.0f} MB RSS (peak)")
+    except Exception:
+        pass
+
+
 @dataclass(frozen=True)
 class LSTMSignal:
     direction: str
@@ -70,13 +80,13 @@ class LSTMSignal:
 if torch and nn:
 
     class LSTMPriceModel(nn.Module):
-        def __init__(self, input_size: int = len(FEATURES), hidden_size: int = 256, num_layers: int = 2) -> None:
+        def __init__(self, input_size: int = len(FEATURES), hidden_size: int = 96, num_layers: int = 1) -> None:
             super().__init__()
-            self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True, dropout=0.3)
+            self.lstm = nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True)
             self.dropout = nn.Dropout(0.3)
-            self.fc1 = nn.Linear(hidden_size, 128)
+            self.fc1 = nn.Linear(hidden_size, 48)
             self.relu = nn.ReLU()
-            self.fc2 = nn.Linear(128, 3)
+            self.fc2 = nn.Linear(48, 3)
 
         def forward(self, x: "torch.Tensor") -> "torch.Tensor":
             output, _ = self.lstm(x)
@@ -121,7 +131,7 @@ class LSTMModelService:
             logger.exception(f"LSTM prediction failed for {symbol}: {exc}")
             return LSTMSignal("NO_TRADE", 0.0, {"LONG": 0.0, "SHORT": 0.0, "NO_TRADE": 1.0}, str(exc))
 
-    def train(self, symbol: str, frame: pd.DataFrame, epochs: int = 30, batch_size: int = 128) -> dict[str, float]:
+    def train(self, symbol: str, frame: pd.DataFrame, epochs: int = 30, batch_size: int = 64) -> dict[str, float]:
         if torch is None or LSTMPriceModel is None or DataLoader is None or TensorDataset is None:
             raise RuntimeError(
                 "PyTorch is unavailable in this environment, so the LSTM model cannot be trained. "
@@ -150,11 +160,14 @@ class LSTMModelService:
         x_arr = np.stack(sequences)
         y_arr = np.array(targets)
         split = max(int(len(x_arr) * 0.8), 1)
+        _log_memory_checkpoint(f"{symbol}: before tensor creation ({len(x_arr)} sequences)")
         train_ds = TensorDataset(torch.tensor(x_arr[:split]), torch.tensor(y_arr[:split]))
         val_x = torch.tensor(x_arr[split:])
         val_y = torch.tensor(y_arr[split:])
+        _log_memory_checkpoint(f"{symbol}: after tensor creation")
 
         model = LSTMPriceModel()
+        _log_memory_checkpoint(f"{symbol}: after model construction")
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
         criterion = nn.CrossEntropyLoss()
         loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
@@ -172,6 +185,8 @@ class LSTMModelService:
                 optimizer.step()
 
             val_loss, val_accuracy = self._evaluate(model, val_x, val_y, criterion)
+            if _epoch == 0:
+                _log_memory_checkpoint(f"{symbol}: after epoch 1 (first backward pass)")
             if val_loss < best_loss:
                 best_loss = val_loss
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
