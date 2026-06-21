@@ -16,8 +16,15 @@ requests>=2.31
 SQLAlchemy>=2.0
 stable-baselines3>=2.3
 ta-lib>=0.4.28
-torch>=2.2
 uvicorn[standard]>=0.29
 websockets>=12.0
 pytest>=8.0
 pytest-asyncio>=0.23
+# NOTE: torch is intentionally NOT listed here. It is installed separately
+# in the Dockerfile from PyTorch's CPU-only wheel index
+# (https://download.pytorch.org/whl/cpu). Letting it resolve from PyPI's
+# default index here pulls in the full CUDA/GPU build (~4.9GB of
+# nvidia-cublas/cudnn/cufft/triton/etc.), which is both unusable (Render
+# has no GPU) and almost certainly the actual cause of "PyTorch failed to
+# import" -- either an OOM during import on memory-constrained instances,
+# or a CUDA-init failure with no compatible driver present.

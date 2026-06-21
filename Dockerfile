@@ -14,6 +14,15 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
+# Install the CPU-only PyTorch build explicitly, before the rest of
+# requirements.txt. Render's instances have no GPU, so the default PyPI
+# wheel (which bundles the full CUDA toolkit -- cublas, cudnn, cufft,
+# triton, etc., ~4.9GB) is both useless and a likely cause of import
+# failures (OOM during import, or CUDA initialization errors) on
+# memory-constrained instances. Installing this first means
+# stable-baselines3's own torch dependency is satisfied by this CPU build
+# instead of triggering a second, GPU-enabled install.
+RUN pip install --no-cache-dir "torch>=2.2" --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
