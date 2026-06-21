@@ -9,6 +9,7 @@ app = "crypto-trading-boot"  # fly launch will offer to rename this if taken
 primary_region = "iad"        # change to whichever region is closest to you
 
 [build]
+  dockerfile = "Dockerfile"
 
 [env]
   PORT = "8000"

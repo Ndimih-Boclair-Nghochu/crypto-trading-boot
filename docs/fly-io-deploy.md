@@ -10,6 +10,20 @@ Postgres (Fly can reach it over the public internet using Render's
 *external* connection string) or move to Fly's own Postgres -- both are
 covered below.
 
+## 0. Important: trial accounts only run machines for 5 minutes
+
+Without a payment method on file, Fly runs your app in **trial mode**:
+machines are force-stopped after 5 minutes (`Trial machine stopping. To
+run for longer than 5m0s, add a credit card...` in the logs), then
+restarted, repeatedly. This looks like a crash but isn't one -- it's a
+deliberate trial limitation, separate from any application bug.
+
+For a continuously-running trading bot, this needs to be resolved before
+the app can stay up: add a payment method at https://fly.io/dashboard ->
+your org -> Billing. Fly's free allowance still applies after adding a
+card -- this isn't necessarily a charge, it just lifts the 5-minute
+trial-mode cap.
+
 ## 1. Install the CLI and sign up
 
 ```bash
