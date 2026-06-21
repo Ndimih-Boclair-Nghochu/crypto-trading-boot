@@ -14,31 +14,26 @@ services:
       interval: 10s
       retries: 5
 
-  bot:
+  app:
     build: .
     depends_on:
       postgres:
         condition: service_healthy
     env_file: .env
-    command: python main.py
-    volumes:
-      - ./models/weights:/app/models/weights
-      - ./logs:/app/logs
-      - runtime_data:/app/.runtime
-
-  dashboard:
-    build: .
-    depends_on:
-      postgres:
-        condition: service_healthy
-    env_file: .env
-    command: streamlit run dashboard.py --server.address=0.0.0.0
+    environment:
+      # Overrides whatever DATABASE_URL is in .env so this compose file
+      # works out of the box against the postgres service above. Remove
+      # this line (and set DATABASE_URL in .env instead) if you're
+      # pointing at an external/managed database instead.
+      DATABASE_URL: postgresql+asyncpg://botuser:strongpassword@postgres:5432/crypto_bot
+      PORT: "10000"
     ports:
-      - "8501:8501"
+      - "10000:10000"
     volumes:
       - ./models/weights:/app/models/weights
       - ./logs:/app/logs
       - runtime_data:/app/.runtime
+    restart: unless-stopped
 
 volumes:
   pgdata:
