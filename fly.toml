@@ -1,0 +1,36 @@
+# Fly.io app configuration. Deploys the existing Dockerfile as-is.
+# See docs/fly-io-deploy.md for the full setup walkthrough.
+#
+# After `fly launch` creates/adjusts this file with your actual app name,
+# you generally don't need to hand-edit it further -- env vars/secrets are
+# set separately via `fly secrets set`, not in this file.
+
+app = "crypto-trading-boot"  # fly launch will offer to rename this if taken
+primary_region = "iad"        # change to whichever region is closest to you
+
+[build]
+
+[env]
+  PORT = "8000"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false   # keep running continuously -- this is a
+                                # trading bot, not a request-driven web app,
+                                # so it must not be allowed to scale to zero
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.checks]
+    [http_service.checks.health]
+      grace_period = "30s"
+      interval = "15s"
+      method = "GET"
+      timeout = "10s"
+      path = "/api/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"   # bump to 2gb (`fly scale memory 2048`) if training still
+                    # OOMs at 1gb -- see docs/fly-io-deploy.md
