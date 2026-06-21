@@ -129,7 +129,13 @@ def enrich_indicators(df: pd.DataFrame, fear_greed: float | None = None) -> pd.D
     out["vwap"] = daily_vwap(out)
     out["cmf_20"] = chaikin_money_flow(out, 20)
     out["volume_profile_nodes"] = [volume_profile_nodes(out)] * len(out)
-    out["fear_greed"] = fear_greed
+    # Neutral midpoint (0-100 scale) when no live Fear & Greed Index reading
+    # is available, e.g. during historical-data training. Leaving this as
+    # None/NaN poisons every row for any downstream consumer (like the LSTM
+    # model) that requires a complete feature set -- dropna() would then
+    # drop the entire dataframe rather than just the rows that genuinely
+    # lack data.
+    out["fear_greed"] = fear_greed if fear_greed is not None else 50.0
     out["atr_spike"] = out["atr_14"] > 3 * out["atr_14"].rolling(20).mean()
     return out
 

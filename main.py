@@ -118,9 +118,10 @@ class TradingSystem:
             rl_still_missing = not (weights_dir / "ppo_trading_agent.zip").exists()
             if lstm_still_missing and len(lstm_still_missing) == len(settings.symbols):
                 raise RuntimeError(
-                    "Training ran but produced no LSTM weight files for any symbol. This almost "
-                    "always means PyTorch failed to import in this container -- check the Render "
-                    "build/runtime logs for a 'PyTorch failed to import' error near startup."
+                    "Training ran but produced no LSTM weight files for any symbol. Check the Render "
+                    "logs just before this message for the specific per-symbol training error "
+                    "(e.g. 'LSTM training failed for <SYMBOL>, skipping: <reason>') or a "
+                    "'PyTorch failed to import' error near container startup."
                 )
             if lstm_still_missing:
                 logger.warning(f"LSTM training did not produce weights for: {lstm_still_missing}")
