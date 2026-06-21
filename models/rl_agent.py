@@ -12,14 +12,16 @@ from utils.logger import logger
 try:
     import gymnasium as gym
     from gymnasium import spaces
-except Exception:  # pragma: no cover
+except Exception as _gym_import_error:  # pragma: no cover
     gym = None
     spaces = None
+    logger.error(f"gymnasium failed to import; the RL agent will be unable to train: {_gym_import_error!r}")
 
 try:
     from stable_baselines3 import PPO
-except Exception:  # pragma: no cover
+except Exception as _sb3_import_error:  # pragma: no cover
     PPO = None
+    logger.error(f"stable-baselines3 failed to import; the RL agent will be unable to train: {_sb3_import_error!r}")
 
 
 ACTIONS = {0: "BUY", 1: "SELL", 2: "HOLD", 3: "CLOSE_LONG", 4: "CLOSE_SHORT"}
@@ -164,8 +166,10 @@ class RLAgentService:
 
     def train(self, rows: list[dict[str, float]], timesteps: int = 25_000) -> None:
         if PPO is None or TradingEnv is None:
-            logger.warning("stable-baselines3 unavailable; skipping PPO training.")
-            return
+            raise RuntimeError(
+                "stable-baselines3 is unavailable in this environment, so the RL agent cannot be "
+                "trained. Check that it installed successfully in the build."
+            )
         env = TradingEnv(rows)
         agent = PPO("MlpPolicy", env, verbose=0)
         agent.learn(total_timesteps=timesteps)

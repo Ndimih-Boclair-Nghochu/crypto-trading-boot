@@ -106,8 +106,36 @@ class TradingSystem:
         try:
             await download_data()
             await train_models()
+
+            # train_models() intentionally isolates per-symbol failures (so
+            # one bad symbol's data doesn't abort the whole run) and always
+            # logs "completed" regardless. That previously meant an
+            # environment-level failure -- e.g. PyTorch failing to import,
+            # which affects every symbol identically -- silently produced
+            # zero weight files while still being reported as a success on
+            # every restart. Verify on disk what was actually produced.
+            lstm_still_missing = [s for s in settings.symbols if not (weights_dir / f"lstm_{s}.pt").exists()]
+            rl_still_missing = not (weights_dir / "ppo_trading_agent.zip").exists()
+            if lstm_still_missing and len(lstm_still_missing) == len(settings.symbols):
+                raise RuntimeError(
+                    "Training ran but produced no LSTM weight files for any symbol. This almost "
+                    "always means PyTorch failed to import in this container -- check the Render "
+                    "build/runtime logs for a 'PyTorch failed to import' error near startup."
+                )
+            if lstm_still_missing:
+                logger.warning(f"LSTM training did not produce weights for: {lstm_still_missing}")
+            if rl_still_missing:
+                logger.warning("RL training did not produce a weights file (ppo_trading_agent.zip missing).")
+
             await self.journal.log_event(
-                "MODEL_TRAINING", "INFO", "Initial model training completed", {"symbols": list(settings.symbols)}
+                "MODEL_TRAINING",
+                "INFO",
+                "Initial model training completed",
+                {
+                    "symbols": list(settings.symbols),
+                    "lstm_missing_after_training": lstm_still_missing,
+                    "rl_missing_after_training": rl_still_missing,
+                },
             )
             logger.info("Initial model training completed.")
         except Exception as exc:
@@ -330,9 +358,16 @@ async def download_data() -> None:
 
 
 async def train_models() -> None:
+    from models.lstm_model import torch as _torch  # local import: reflects current module state
+
     ta = TechnicalAnalysisEngine()
     lstm = LSTMModelService()
     rl_rows: list[dict[str, float]] = []
+    if _torch is None:
+        raise RuntimeError(
+            "PyTorch is unavailable in this environment, so no LSTM model can be trained for any "
+            "symbol. Check the build/runtime logs for a 'PyTorch failed to import' error."
+        )
     for i, symbol in enumerate(settings.symbols, start=1):
         path = settings.runtime_dir / f"training_{symbol}_1h.csv"
         if not path.exists():
@@ -354,7 +389,10 @@ async def train_models() -> None:
             logger.warning(f"LSTM training failed for {symbol}, skipping: {exc}")
     if rl_rows:
         logger.info(f"Training RL agent on {len(rl_rows)} rows")
-        RLAgentService().train(rl_rows)
+        try:
+            RLAgentService().train(rl_rows)
+        except Exception as exc:
+            logger.warning(f"RL agent training failed, continuing without it: {exc}")
 
 
 def _row_to_candle(symbol: str, timeframe: str, row: pd.Series) -> Any:

@@ -15,8 +15,14 @@ try:
     import torch
     from torch import nn
     from torch.utils.data import DataLoader, TensorDataset
-except Exception:  # pragma: no cover
+except Exception as _torch_import_error:  # pragma: no cover
     torch = None
+    nn = None
+    DataLoader = None
+    TensorDataset = None
+    logger.error(
+        f"PyTorch failed to import; the LSTM model will be unable to train or predict: {_torch_import_error!r}"
+    )
     nn = None
     DataLoader = None
     TensorDataset = None
@@ -106,8 +112,11 @@ class LSTMModelService:
 
     def train(self, symbol: str, frame: pd.DataFrame, epochs: int = 30, batch_size: int = 128) -> dict[str, float]:
         if torch is None or LSTMPriceModel is None or DataLoader is None or TensorDataset is None:
-            logger.warning("PyTorch unavailable; skipping LSTM training.")
-            return {"val_accuracy": 0.0, "val_loss": float("inf")}
+            raise RuntimeError(
+                "PyTorch is unavailable in this environment, so the LSTM model cannot be trained. "
+                "Check that 'torch' installed successfully in the build (see earlier log lines for "
+                "the import error) and that the instance has enough memory to import it."
+            )
         if len(frame) < self.sequence_length + 20:
             raise ValueError("Not enough rows to train LSTM")
 
