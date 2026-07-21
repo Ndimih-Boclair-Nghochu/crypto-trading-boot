@@ -49,6 +49,13 @@ class ConfidenceGate:
         base_threshold = self._confidence_threshold()
         threshold = base_threshold * 0.85 if extreme_regime else base_threshold
 
+        # LAB_MODE: testnet-only relaxation so the execution path can be
+        # exercised end to end. ANDed with use_testnet -- a loosened gate
+        # must never apply to real money.
+        lab = bool(getattr(self.settings, "lab_mode", False)) and self.settings.use_testnet
+        min_confluence = 35 if lab else 65
+        min_agreement = 2 if lab else 4
+
         if direction not in {"LONG", "SHORT"}:
             if lstm_signal.reason:
                 reasons.append(f"LSTM did not produce a tradeable signal ({lstm_signal.reason})")
@@ -59,16 +66,22 @@ class ConfidenceGate:
             reasons.append(f"LSTM confidence {lstm_signal.confidence:.2f} below {threshold:.2f}{suffix}")
 
         expected_action = "BUY" if direction == "LONG" else "SELL"
-        if rl_decision.action != expected_action:
+        # A HOLD from an undertrained RL agent is tolerated in lab mode;
+        # an outright opposite call still vetoes.
+        rl_conflicts = (
+            rl_decision.action not in {expected_action, "HOLD"} if lab
+            else rl_decision.action != expected_action
+        )
+        if rl_conflicts:
             reasons.append(f"RL action {rl_decision.action} does not match {expected_action}")
 
-        if float(confluence.get("score", 0) or 0) < 65:
-            reasons.append("multi-timeframe confluence below 65")
+        if float(confluence.get("score", 0) or 0) < min_confluence:
+            reasons.append(f"multi-timeframe confluence below {min_confluence}")
         if confluence.get("direction") not in {direction, None}:
             reasons.append("multi-timeframe direction contradicts LSTM")
 
         agreement = self._indicator_agreement(primary, direction)
-        if agreement < 4:
+        if agreement < min_agreement:
             reasons.append(f"only {agreement} independent indicators agree")
 
         exceptional_confidence = (

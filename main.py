@@ -43,6 +43,7 @@ class TradingSystem:
         self.learning = LearningEngine(database, self.lstm, self.rl)
         self.alerter = AlertManager()
         self._reconcile_at = datetime.now(UTC)
+        self._learning_at = datetime.now(UTC)
 
     async def start(self) -> None:
         if not settings.use_testnet:
@@ -273,6 +274,9 @@ class TradingSystem:
                     if datetime.now(UTC) >= self._reconcile_at:
                         await self.execution.reconcile_orders()
                         self._reconcile_at = datetime.now(UTC) + timedelta(minutes=5)
+                    if datetime.now(UTC) >= self._learning_at:
+                        await self.learning.run()
+                        self._learning_at = datetime.now(UTC) + timedelta(seconds=60)
                     await asyncio.sleep(30)
                 except Exception as exc:
                     logger.exception(f"Unexpected main loop error; sleeping then resuming: {exc}")
@@ -292,16 +296,24 @@ class TradingSystem:
     async def _write_equity_snapshot(self) -> None:
         try:
             balance = await self.client.get_usdt_balance()
+            # Equity = free USDT + market value of coins held from the bots OWN
+            # positions. The old formula added only unrealized PnL, omitting cost
+            # basis -- so a buy dropped equity by the full notional (phantom ~25%
+            # drawdown that latched the circuit breaker). Pre-funded testnet coins
+            # are excluded: only tracked positions count.
+            holdings_value = Decimal("0")
             open_pnl = Decimal("0")
             for position in self.risk.open_positions.values():
                 current_price = await self._get_current_price(position.symbol)
                 if current_price <= 0:
                     continue
                 if position.direction == "LONG":
+                    holdings_value += position.quantity * current_price
                     open_pnl += position.quantity * (current_price - position.entry_price)
                 else:
+                    holdings_value -= position.quantity * current_price
                     open_pnl += position.quantity * (position.entry_price - current_price)
-            total_equity = Decimal(str(balance)) + open_pnl
+            total_equity = Decimal(str(balance)) + holdings_value
             self.risk.circuit_breaker_hit(total_equity)
             peak = self.risk.peak_equity if self.risk.peak_equity > 0 else total_equity
             drawdown_pct = ((peak - total_equity) / peak * Decimal("100")) if peak > 0 else Decimal("0")

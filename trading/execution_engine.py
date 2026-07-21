@@ -293,12 +293,26 @@ class ExecutionEngine:
     async def _close_quantity(self, symbol: str, direction: str, quantity: Decimal) -> ExecutionResult:
         if quantity <= 0:
             return ExecutionResult(False, reason="quantity <= 0")
+        try:
+            for order in await self.client.get_open_orders(symbol):
+                oid = order.get("orderId")
+                if oid is not None:
+                    await self.client.cancel_order(symbol, str(oid))
+        except Exception as exc:
+            logger.warning(f"{symbol}: could not cancel resting orders before close: {exc}")
+        side = "SELL" if direction == "LONG" else "BUY"
+        if side == "SELL":
+            base = symbol[:-4] if symbol.endswith("USDT") else symbol
+            free = await self.client.get_asset_free(base)
+            if free < quantity:
+                quantity = free
         filters = await self.client.get_symbol_filters(symbol)
         if filters:
             quantity = filters.round_quantity(quantity)
             if filters.min_qty > 0 and quantity < filters.min_qty:
                 return ExecutionResult(False, status="FILTER_REJECTED", reason=f"quantity {quantity} below minQty {filters.min_qty}")
-        side = "SELL" if direction == "LONG" else "BUY"
+        if quantity <= 0:
+            return ExecutionResult(False, reason="no free balance to close")
         result = await self.client.place_order(symbol=symbol, side=side, type="MARKET", quantity=_fmt(quantity))
         return ExecutionResult(result.accepted, result.order_id, result.status, result.reason, result.raw)
 

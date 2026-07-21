@@ -435,6 +435,18 @@ class ResilientBinanceClient:
                 return Decimal(str(balance.get("free", "0")))
         return Decimal("0")
 
+    @safe_api_call(lambda: Decimal("0"))
+    async def get_asset_free(self, asset: str) -> Decimal:
+        if not self.client:
+            return Decimal("0")
+        await self._throttle_if_needed()
+        account = await self.client.get_account()
+        self._capture_client_response_headers()
+        for balance in account.get("balances", []):
+            if balance.get("asset") == asset:
+                return Decimal(str(balance.get("free", "0")))
+        return Decimal("0")
+
     @safe_api_call(lambda: OrderResult(False, reason="order API failed"))
     async def place_order(self, **kwargs: Any) -> OrderResult:
         if not self.client:
@@ -470,7 +482,11 @@ class ResilientBinanceClient:
         if hasattr(self.client, "create_order_list_oco"):
             raw = await self.client.create_order_list_oco(**kwargs)
         elif hasattr(self.client, "create_oco_order"):
-            raw = await self.client.create_oco_order(**_legacy_oco_kwargs(kwargs))
+            # python-binance >=1.0.37 routes create_oco_order to the NEW
+            # POST /api/v3/orderList/oco endpoint, which REQUIRES aboveType/
+            # belowType. Legacy stopPrice params caused "APIError -1102:
+            # aboveType was not sent". Forward the new-style kwargs as-is.
+            raw = await self.client.create_oco_order(**kwargs)
         else:
             return OrderResult(False, reason="python-binance client does not expose an OCO helper")
         self._capture_client_response_headers()

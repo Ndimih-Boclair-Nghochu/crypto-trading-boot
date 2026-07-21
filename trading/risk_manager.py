@@ -225,7 +225,11 @@ class RiskManager:
             kelly_quantity = Decimal("0")
         else:
             kelly_quantity = (balance * half_kelly) / entry
-        return min(fixed_fractional, atr_based, kelly_quantity).quantize(Decimal("0.00000001"))
+        # Hard cap per-trade notional to a small fraction of equity, so many
+        # positions can run concurrently and no single trade can drain capital.
+        max_pos_fraction = _d(getattr(self.settings, "max_position_pct", 5.0)) / Decimal("100")
+        capped = (balance * max_pos_fraction) / entry if entry > 0 else Decimal("0")
+        return min(fixed_fractional, atr_based, kelly_quantity, capped).quantize(Decimal("0.00000001"))
 
     def _half_kelly_fraction(self) -> Decimal | None:
         trades = self.closed_trades[-50:]

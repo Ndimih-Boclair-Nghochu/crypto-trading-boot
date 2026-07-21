@@ -69,6 +69,15 @@ def _log_memory_checkpoint(label: str) -> None:
         pass
 
 
+def _lab_mode() -> bool:
+    """LAB_MODE relaxations apply on testnet only -- never against real money."""
+    try:
+        from config import settings as _s
+        return bool(getattr(_s, "lab_mode", False)) and bool(_s.use_testnet)
+    except Exception:
+        return False
+
+
 @dataclass(frozen=True)
 class LSTMSignal:
     direction: str
@@ -126,6 +135,18 @@ class LSTMModelService:
                 probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
             probabilities = {INDEX_TO_SIGNAL[i]: float(probs[i]) for i in range(3)}
             idx = int(np.argmax(probs))
+
+            if _lab_mode():
+                logger.info(f"LSTM {symbol} probabilities: {probabilities}")
+                # Testnet only: re-ask as "given we trade, which way?" by renormalising
+                # over directional classes so confidence stays comparable to the gate.
+                if INDEX_TO_SIGNAL[idx] == "NO_TRADE":
+                    long_p = probabilities["LONG"]; short_p = probabilities["SHORT"]
+                    total = long_p + short_p
+                    if total > 0:
+                        direction = "LONG" if long_p >= short_p else "SHORT"
+                        return LSTMSignal(direction, max(long_p, short_p) / total, probabilities)
+
             return LSTMSignal(INDEX_TO_SIGNAL[idx], float(probs[idx]), probabilities)
         except Exception as exc:
             logger.exception(f"LSTM prediction failed for {symbol}: {exc}")
@@ -169,7 +190,18 @@ class LSTMModelService:
         model = LSTMPriceModel()
         _log_memory_checkpoint(f"{symbol}: after model construction")
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-        criterion = nn.CrossEntropyLoss()
+        # generate_labels() marks a bar LONG/SHORT only on a >=1.5*ATR excursion, so
+        # the training set is overwhelmingly NO_TRADE. With an unweighted loss the model
+        # minimises error by predicting NO_TRADE unconditionally -- ~90% accurate and
+        # useless, which is what it learned. Inverse-frequency weights fix that.
+        _counts = np.bincount(y_arr[:split], minlength=3).astype(np.float64)
+        _counts[_counts == 0] = 1.0
+        _weights = _counts.sum() / (3.0 * _counts)
+        logger.info(
+            f"{symbol}: label counts LONG/SHORT/NO_TRADE={_counts.tolist()} "
+            f"class_weights={[round(w, 3) for w in _weights.tolist()]}"
+        )
+        criterion = nn.CrossEntropyLoss(weight=torch.tensor(_weights, dtype=torch.float32))
         loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
         best_loss = float("inf")
         patience = 5

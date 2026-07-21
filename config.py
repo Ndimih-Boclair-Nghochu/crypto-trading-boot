@@ -86,6 +86,7 @@ class Settings:
     use_testnet: bool = field(default_factory=lambda: _bool("USE_TESTNET", True))
     live_trading_reviewed: bool = field(default_factory=lambda: _bool("LIVE_TRADING_REVIEWED", False))
     testnet_trade_count: int = field(default_factory=lambda: _int("TESTNET_TRADE_COUNT", 0))
+    lab_mode: bool = field(default_factory=lambda: _bool("LAB_MODE", False))
 
     database_url: str = field(default_factory=_database_url)
 
@@ -102,6 +103,7 @@ class Settings:
     max_concurrent_trades: int = field(default_factory=lambda: _int("MAX_CONCURRENT_TRADES", 3))
     confidence_threshold: float = field(default_factory=lambda: _float("CONFIDENCE_THRESHOLD", 0.70))
     max_portfolio_risk_pct: float = field(default_factory=lambda: _float("MAX_PORTFOLIO_RISK_PCT", 3.0))
+    max_position_pct: float = field(default_factory=lambda: _float("MAX_POSITION_PCT", 5.0))
     drawdown_circuit_breaker_pct: float = field(default_factory=lambda: _float("DRAWDOWN_CIRCUIT_BREAKER_PCT", 10.0))
 
     cryptocompare_api_key: str = field(default_factory=lambda: os.getenv("CRYPTOCOMPARE_API_KEY", ""))
