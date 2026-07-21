@@ -344,10 +344,12 @@ class ExecutionEngine:
         async with self.lock:
             results = []
             for symbol, managed in list(self.open_trades.items()):
+                price = await self._latest_price(symbol)
                 results.append(await self._close_quantity(symbol, managed.plan.direction or "", managed.remaining_quantity))
                 self.open_trades.pop(symbol, None)
                 if self.journal:
-                    await self.journal.log_trade_exit(symbol, Decimal("0"), "MANUAL")
+                    exit_price = price if price > 0 else managed.plan.entry_price
+                    await self.journal.log_trade_exit(symbol, exit_price, "MANUAL")
                 await self.alerter.send(
                     f"MANUAL CLOSE: {symbol}",
                     {"reason": "MANUAL", "pnl_approx": "see dashboard"},
@@ -359,11 +361,13 @@ class ExecutionEngine:
             managed = self.open_trades.get(symbol)
             if not managed:
                 return ExecutionResult(False, reason="symbol not managed")
+            price = await self._latest_price(symbol)
             result = await self._close_quantity(symbol, managed.plan.direction or "", managed.remaining_quantity)
             if result.accepted:
                 self.open_trades.pop(symbol, None)
                 if self.journal:
-                    await self.journal.log_trade_exit(symbol, Decimal("0"), "MANUAL")
+                    exit_price = price if price > 0 else managed.plan.entry_price
+                    await self.journal.log_trade_exit(symbol, exit_price, "MANUAL")
                 await self.alerter.send(
                     f"MANUAL CLOSE: {symbol}",
                     {"reason": "MANUAL", "pnl_approx": "see dashboard"},

@@ -25,6 +25,7 @@ from db.connection import Database
 
 STATE_PATH = settings.trading_state_path
 RISK_OVERRIDE_PATH = settings.runtime_dir / "risk_overrides.json"
+CLOSE_REQUESTS_PATH = settings.runtime_dir / "close_requests.json"
 
 
 def _read_json(path: Any, default: dict[str, Any]) -> dict[str, Any]:
@@ -176,3 +177,14 @@ async def save_risk_settings(body: RiskSettingsBody) -> dict[str, Any]:
     RISK_OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
     RISK_OVERRIDE_PATH.write_text(json.dumps(overrides, indent=2), encoding="utf-8")
     return overrides
+
+
+@app.post("/api/positions/{symbol}/close")
+async def close_position(symbol: str) -> dict[str, Any]:
+    symbol = symbol.upper()
+    current = _read_json(CLOSE_REQUESTS_PATH, {"symbols": []})
+    pending = set(current.get("symbols", []))
+    pending.add(symbol)
+    CLOSE_REQUESTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CLOSE_REQUESTS_PATH.write_text(json.dumps({"symbols": sorted(pending)}), encoding="utf-8")
+    return {"ok": True, "queued": symbol}

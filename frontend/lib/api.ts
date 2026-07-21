@@ -24,6 +24,10 @@ export type Trade = {
   outcome: string;
   entry_time: string;
   exit_time?: string | null;
+  current_price?: number | string | null;
+  market_value?: number | string | null;
+  unrealized_pnl?: number | string | null;
+  unrealized_pct?: number | string | null;
 };
 
 export type EquityPoint = {
@@ -93,6 +97,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => request<TradingState>("/api/health"),
+  closePosition: (symbol: string) =>
+    request<{ ok: boolean; queued: string }>(`/api/positions/${symbol}/close`, { method: "POST" }),
   overview: () => request<Overview>("/api/overview"),
   riskSettings: () => request<RiskSettings>("/api/risk-settings"),
   saveRiskSettings: (settings: RiskSettings) =>

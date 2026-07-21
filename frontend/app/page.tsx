@@ -41,6 +41,7 @@ export default function Page() {
   const [missedPolls, setMissedPolls] = useState(0);
   const [actionError, setActionError] = useState<string | null>(null);
   const [savingRisk, setSavingRisk] = useState(false);
+  const [stopping, setStopping] = useState<Record<string, boolean>>({});
 
   const refresh = useCallback(async () => {
     const results = await Promise.allSettled([api.health(), api.overview()]);
@@ -93,6 +94,19 @@ export default function Page() {
       setActionError("Could not save risk settings — check that the backend is reachable.");
     } finally {
       setSavingRisk(false);
+    }
+  };
+
+  const handleStop = async (symbol: string) => {
+    setStopping((s) => ({ ...s, [symbol]: true }));
+    try {
+      await api.closePosition(symbol);
+      setActionError(null);
+      await refresh();
+    } catch {
+      setActionError(`Could not stop ${symbol} — is the backend reachable?`);
+    } finally {
+      setStopping((s) => ({ ...s, [symbol]: false }));
     }
   };
 
@@ -238,10 +252,13 @@ export default function Page() {
                       <th>Symbol</th>
                       <th>Dir</th>
                       <th>Entry</th>
+                      <th>Now</th>
                       <th>SL</th>
                       <th>TP1</th>
                       <th>Qty</th>
+                      <th>Unreal. P&amp;L</th>
                       <th>Opened</th>
+                      <th>Action</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -250,10 +267,23 @@ export default function Page() {
                         <td>{p.symbol}</td>
                         <td className={p.direction?.toLowerCase() === "long" ? "up" : "down"}>{p.direction}</td>
                         <td>{fmt(p.entry_price, 4)}</td>
+                        <td>{p.current_price != null ? fmt(p.current_price, 4) : "—"}</td>
                         <td>{fmt(p.sl_price, 4)}</td>
                         <td>{fmt(p.tp1_price, 4)}</td>
                         <td>{fmt(p.quantity, 4)}</td>
+                        <td className={p.unrealized_pnl != null ? (num(p.unrealized_pnl) >= 0 ? "up" : "down") : ""}>
+                          {p.unrealized_pnl != null ? fmtSigned(p.unrealized_pnl) : "—"}
+                        </td>
                         <td>{fmtTime(p.entry_time)}</td>
+                        <td>
+                          <button
+                            className="btn btn--danger"
+                            disabled={!!stopping[p.symbol]}
+                            onClick={() => handleStop(p.symbol)}
+                          >
+                            {stopping[p.symbol] ? "Stopping…" : "Stop"}
+                          </button>
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -353,8 +383,18 @@ export default function Page() {
                         <td>{t.symbol}</td>
                         <td className={t.direction?.toLowerCase() === "long" ? "up" : "down"}>{t.direction}</td>
                         <td>{fmt(t.entry_price, 4)}</td>
-                        <td>{t.exit_price !== null && t.exit_price !== undefined ? fmt(t.exit_price, 4) : "—"}</td>
-                        <td className={num(t.pnl_usd) >= 0 ? "up" : "down"}>{fmtSigned(t.pnl_usd)}</td>
+                        <td>
+                          {t.outcome === "OPEN" && t.current_price != null
+                            ? fmt(t.current_price, 4)
+                            : t.exit_price !== null && t.exit_price !== undefined
+                            ? fmt(t.exit_price, 4)
+                            : "—"}
+                        </td>
+                        {t.outcome === "OPEN" && t.unrealized_pnl != null ? (
+                          <td className={num(t.unrealized_pnl) >= 0 ? "up" : "down"}>{fmtSigned(t.unrealized_pnl)}</td>
+                        ) : (
+                          <td className={num(t.pnl_usd) >= 0 ? "up" : "down"}>{fmtSigned(t.pnl_usd)}</td>
+                        )}
                         <td>{t.r_multiple !== null && t.r_multiple !== undefined ? fmt(t.r_multiple, 2) : "—"}</td>
                         <td>{t.outcome}</td>
                       </tr>

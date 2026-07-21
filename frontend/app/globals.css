@@ -468,3 +468,31 @@ input:focus-visible {
     padding: 6px 8px;
   }
 }
+
+
+/* ============ Mobile responsiveness ============ */
+.table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.table-wrap table { min-width: max-content; }
+.btn { min-height: 38px; }
+.btn--danger { white-space: nowrap; }
+
+@media (max-width: 720px) {
+  .ticker { flex-wrap: wrap; gap: 6px 10px; font-size: 12px; padding: 8px 10px; }
+  .ticker__brand { width: 100%; margin-bottom: 2px; }
+  .ticker__spacer { display: none; }
+  .shell { padding: 12px; }
+  .grid { grid-template-columns: repeat(2, 1fr) !important; gap: 10px !important; }
+  .grid--two { grid-template-columns: 1fr !important; gap: 10px !important; }
+  .metric__value { font-size: 20px; }
+  h1 { font-size: 20px; }
+  h2 { font-size: 16px; }
+  table { font-size: 12px; }
+  th, td { padding: 6px 8px; white-space: nowrap; }
+  .btn { padding: 8px 12px; }
+}
+
+@media (max-width: 430px) {
+  .grid { grid-template-columns: 1fr !important; }
+  .ticker { font-size: 11px; }
+  .metric__value { font-size: 18px; }
+}

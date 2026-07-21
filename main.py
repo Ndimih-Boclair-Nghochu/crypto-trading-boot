@@ -180,6 +180,8 @@ class TradingSystem:
                     snapshot = await self.data.update_all()
                     meta = snapshot["meta"]
                     for symbol in settings.symbols:
+                        if symbol in self.execution.open_trades:
+                            continue
                         candles_by_tf = snapshot["candles"].get(symbol, {})
                         analysis = self.ta.compute_all(candles_by_tf, meta=meta)
                         if not analysis.get("timeframes"):
@@ -253,6 +255,7 @@ class TradingSystem:
                         else:
                             await self.journal.log_event("ORDER_REJECTED", "WARNING", result.reason or "order rejected", {"symbol": symbol})
 
+                    await self._process_close_requests()
                     await self._write_equity_snapshot()
                     if self.risk.circuit_breaker_active and self.execution.open_trades:
                         logger.critical("CIRCUIT BREAKER ACTIVE - emergency closing all positions")
@@ -288,6 +291,27 @@ class TradingSystem:
 
     async def learning_tick(self) -> None:
         await self.learning.record_state()
+
+    async def _process_close_requests(self) -> None:
+        path = settings.runtime_dir / "close_requests.json"
+        if not path.exists():
+            return
+        try:
+            symbols = json.loads(path.read_text(encoding="utf-8")).get("symbols", [])
+        except Exception:
+            return
+        if not symbols:
+            return
+        for symbol in symbols:
+            try:
+                result = await self.execution.emergency_close_symbol(symbol)
+                await self.journal.log_event("MANUAL_CLOSE", "INFO", f"Manual stop requested for {symbol}", {"accepted": result.accepted, "reason": result.reason})
+            except Exception as exc:
+                logger.warning(f"Manual close failed for {symbol}: {exc}")
+        try:
+            path.write_text(json.dumps({"symbols": []}), encoding="utf-8")
+        except Exception:
+            pass
 
     async def _get_current_price(self, symbol: str) -> Decimal:
         candles = await self.client.get_ohlcv(symbol, "1m", 1)
