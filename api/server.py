@@ -188,3 +188,36 @@ async def close_position(symbol: str) -> dict[str, Any]:
     CLOSE_REQUESTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     CLOSE_REQUESTS_PATH.write_text(json.dumps({"symbols": sorted(pending)}), encoding="utf-8")
     return {"ok": True, "queued": symbol}
+
+
+@app.get("/api/models")
+async def model_status() -> dict[str, Any]:
+    """Per-symbol model provenance, so the dashboard can show what it is trading on."""
+    weights_dir = settings.base_dir / "models" / "weights"
+    models: list[dict[str, Any]] = []
+    for symbol in settings.symbols:
+        meta = _read_json(weights_dir / f"lstm_{symbol}.json", {})
+        models.append(
+            {
+                "symbol": symbol,
+                "trained_at": meta.get("trained_at"),
+                "model_version": meta.get("model_version"),
+                "rows_trained": meta.get("rows_trained"),
+                "directional_precision": meta.get("directional_precision"),
+                "val_accuracy": meta.get("val_accuracy"),
+                "label_counts": meta.get("label_counts"),
+            }
+        )
+    rl_meta = _read_json(weights_dir / "ppo_trading_agent.json", {})
+    return {
+        "lstm": models,
+        "rl": {
+            "agent_version": rl_meta.get("agent_version"),
+            "rows": rl_meta.get("rows"),
+            "timesteps": rl_meta.get("timesteps"),
+            "mode": rl_meta.get("mode"),
+        },
+        "min_model_quality": settings.min_model_quality,
+        "market_type": settings.market_type,
+        "shorting_available": settings.shorting_available,
+    }

@@ -325,8 +325,16 @@ class ResilientBinanceClient:
     ) -> list[Candle]:
         candles: list[Candle] = []
         cursor = start_time_ms
+        # Binance Spot Testnet runs its own matching engine and retains only a
+        # few weeks of klines, so training against it means fitting a model to
+        # roughly 1100 bars of prices that were never quoted anywhere real.
+        # Historical data therefore comes from mainnet's *public* kline
+        # endpoint, which needs no API key, while orders still route wherever
+        # USE_TESTNET points. Set TRAINING_DATA_SOURCE=venue to opt out.
+        from_mainnet = self.settings.training_data_source != "venue"
+        base_url = self.settings.training_data_base_url
         while cursor < end_time_ms:
-            if self.client:
+            if self.client and not from_mainnet:
                 raw = await self.client.get_klines(
                     symbol=symbol,
                     interval=interval,
@@ -337,7 +345,7 @@ class ResilientBinanceClient:
                 self._capture_client_response_headers()
             else:
                 raw = await self._public_get(
-                    self.settings.binance_spot_base_url,
+                    base_url,
                     "/api/v3/klines",
                     {"symbol": symbol, "interval": interval, "startTime": cursor, "endTime": end_time_ms, "limit": limit},
                 )
@@ -437,6 +445,11 @@ class ResilientBinanceClient:
 
     @safe_api_call(lambda: Decimal("0"))
     async def get_asset_free(self, asset: str) -> Decimal:
+        """Free balance of an arbitrary asset.
+
+        Needed before any SELL: that side spends the base asset, so checking the
+        USDT balance says nothing about whether the order can fill.
+        """
         if not self.client:
             return Decimal("0")
         await self._throttle_if_needed()
@@ -482,10 +495,10 @@ class ResilientBinanceClient:
         if hasattr(self.client, "create_order_list_oco"):
             raw = await self.client.create_order_list_oco(**kwargs)
         elif hasattr(self.client, "create_oco_order"):
-            # python-binance >=1.0.37 routes create_oco_order to the NEW
-            # POST /api/v3/orderList/oco endpoint, which REQUIRES aboveType/
-            # belowType. Legacy stopPrice params caused "APIError -1102:
-            # aboveType was not sent". Forward the new-style kwargs as-is.
+            # python-binance >= 1.0.37 routes create_oco_order to the new
+            # POST /api/v3/orderList/oco endpoint, which requires aboveType and
+            # belowType. Translating to the legacy stopPrice form produced
+            # "APIError -1102: aboveType was not sent", so forward as-is.
             raw = await self.client.create_oco_order(**kwargs)
         else:
             return OrderResult(False, reason="python-binance client does not expose an OCO helper")

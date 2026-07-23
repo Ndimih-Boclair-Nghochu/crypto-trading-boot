@@ -34,7 +34,10 @@ class TechnicalAnalysisEngine:
         latest["bias"] = directional_bias(latest)
         return {
             "latest": latest,
-            "series_tail": df.tail(120).replace({np.nan: None}).to_dict(orient="records"),
+            # 200 rows: the model needs a 60-bar sequence built from features
+            # whose longest warm-up window is 50 bars, and the learning engine
+            # reconstructs training frames from these same rows.
+            "series_tail": df.tail(200).replace({np.nan: None}).to_dict(orient="records"),
             "timeframe": candles[-1].timeframe,
         }
 

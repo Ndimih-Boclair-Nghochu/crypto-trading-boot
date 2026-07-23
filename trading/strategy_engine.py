@@ -3,7 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import pandas as pd
+
+from analysis.features import MODEL_FEATURES, build_model_features
 from analysis.regime_classifier import MarketRegime, classify_regime
+from config import Settings, settings
 from models.confidence_gate import GateResult
 from models.lstm_model import LSTMSignal
 from models.rl_agent import RLDecision
@@ -32,9 +36,13 @@ class TradeSignal:
     indicator_agreement: int
     indicator_state: dict[str, Any]
     reasons: list[str] = field(default_factory=list)
+    conviction: float = 0.0
 
 
 class StrategyEngine:
+    def __init__(self, cfg: Settings = settings) -> None:
+        self.settings = cfg
+
     def classify_regime(self, analysis_payload: dict[str, Any], fear_greed: float | None = None) -> MarketRegime:
         latest = self.primary_latest(analysis_payload)
         return classify_regime(latest, fear_greed=fear_greed)
@@ -69,35 +77,36 @@ class StrategyEngine:
                 "latest": latest,
                 "confluence": analysis_payload.get("confluence", {}),
                 "lstm_probabilities": lstm_signal.probabilities,
+                "lstm_margin": round(lstm_signal.margin, 4),
+                "model_quality": round(lstm_signal.model_quality, 4),
                 "rl_action": rl_decision.action,
+                "rl_probabilities": rl_decision.probabilities or {},
+                "conviction": gate.conviction_detail,
                 "secondary_check": secondary_check,
-                "raw_candles": primary_frame.get("series_tail", [])[-60:],
+                "raw_candles": primary_frame.get("series_tail", [])[-120:],
             },
             reasons=gate.reasons,
+            conviction=gate.conviction,
         )
 
-    def build_rl_state(
-        self,
-        analysis_payload: dict[str, Any],
-        lstm_signal: LSTMSignal,
-        open_pnl: float = 0.0,
-        drawdown: float = 0.0,
-        position: float = 0.0,
-        entry_price: float = 0.0,
-    ) -> dict[str, Any]:
-        latest = self.primary_latest(analysis_payload)
-        state = dict(latest)
-        state["lstm_confidence"] = lstm_signal.confidence
-        state["confluence_score"] = float(analysis_payload.get("confluence", {}).get("score", 0) or 0)
-        state["open_pnl"] = open_pnl
-        state["drawdown"] = drawdown
-        state["position"] = position
-        state["entry_price"] = entry_price
-        return state
+    def build_rl_features(self, analysis_payload: dict[str, Any]) -> dict[str, float]:
+        """Latest stationary feature row, keyed exactly as the RL agent expects."""
+        rows = self.primary_frame(analysis_payload).get("series_tail", [])
+        if not rows:
+            return {name: 0.0 for name in MODEL_FEATURES}
+        frame = pd.DataFrame(rows)
+        try:
+            features = build_model_features(frame).ffill().fillna(0.0)
+        except Exception:
+            return {name: 0.0 for name in MODEL_FEATURES}
+        if features.empty:
+            return {name: 0.0 for name in MODEL_FEATURES}
+        row = features.iloc[-1]
+        return {name: float(row.get(name, 0.0) or 0.0) for name in MODEL_FEATURES}
 
     def primary_latest(self, analysis_payload: dict[str, Any]) -> dict[str, Any]:
         frames = analysis_payload.get("timeframes", {})
-        for preferred in ("1h", "15m", "4h", "5m", "1m", "1d"):
+        for preferred in self.settings.timeframe_preference:
             if preferred in frames:
                 return frames[preferred].get("latest", {})
         if frames:
@@ -106,7 +115,7 @@ class StrategyEngine:
 
     def primary_frame(self, analysis_payload: dict[str, Any]) -> dict[str, Any]:
         frames = analysis_payload.get("timeframes", {})
-        for preferred in ("1h", "15m", "4h", "5m", "1m", "1d"):
+        for preferred in self.settings.timeframe_preference:
             if preferred in frames:
                 return frames[preferred]
         if frames:

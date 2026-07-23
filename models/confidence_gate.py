@@ -9,6 +9,7 @@ from typing import Any
 import requests
 
 from config import Settings, settings
+from models.conviction import ConvictionScore, score_conviction
 from models.lstm_model import LSTMSignal
 from models.rl_agent import RLDecision
 from utils.logger import logger
@@ -26,6 +27,8 @@ class GateResult:
     failed_gate: str | None = None
     reasons: list[str] = field(default_factory=list)
     indicator_agreement: int = 0
+    conviction: float = 0.0
+    conviction_detail: dict[str, Any] = field(default_factory=dict)
 
 
 class ConfidenceGate:
@@ -40,55 +43,106 @@ class ConfidenceGate:
         rl_decision: RLDecision,
         indicators: dict[str, Any],
         symbol: str,
+        cooldown_reason: str | None = None,
     ) -> GateResult:
         reasons: list[str] = []
         direction = lstm_signal.direction
         confluence = indicators.get("confluence", {})
         primary = self._primary_latest(indicators)
-        extreme_regime = "EXTREME" in str(indicators.get("regime", ""))
-        base_threshold = self._confidence_threshold()
-        threshold = base_threshold * 0.85 if extreme_regime else base_threshold
+        regime = str(indicators.get("regime", "MIXED"))
+        extreme_regime = "EXTREME" in regime
 
-        # LAB_MODE: testnet-only relaxation so the execution path can be
-        # exercised end to end. ANDed with use_testnet -- a loosened gate
-        # must never apply to real money.
-        lab = bool(getattr(self.settings, "lab_mode", False)) and self.settings.use_testnet
-        min_confluence = 35 if lab else 65
-        min_agreement = 2 if lab else 4
+        overrides = self._overrides()
+        base_threshold = float(overrides.get("confidence_threshold", self.settings.confidence_threshold))
+        threshold = base_threshold * 0.85 if extreme_regime else base_threshold
+        min_margin = float(self.settings.lstm_min_margin)
+        min_confluence = float(self.settings.min_confluence_score)
+        min_agreement = int(self.settings.min_indicator_agreement)
+
+        confluence_value = float(confluence.get("score", 0) or 0)
+        agreement = self._indicator_agreement(primary, direction)
+
+        conviction = score_conviction(
+            lstm_signal,
+            rl_decision,
+            direction=direction if direction in {"LONG", "SHORT"} else "LONG",
+            regime=regime,
+            confluence_score=confluence_value,
+            indicator_agreement=agreement,
+            confidence_threshold=threshold,
+            min_margin=min_margin,
+            min_confluence=min_confluence,
+            min_agreement=min_agreement,
+        )
 
         if direction not in {"LONG", "SHORT"}:
-            if lstm_signal.reason:
-                reasons.append(f"LSTM did not produce a tradeable signal ({lstm_signal.reason})")
-            else:
-                reasons.append("LSTM output is NO_TRADE")
+            reasons.append(
+                f"LSTM did not produce a tradeable signal ({lstm_signal.reason})"
+                if lstm_signal.reason
+                else "LSTM output is NO_TRADE"
+            )
+            return self._blocked(reasons, agreement, conviction)
+
+        # Spot accounts cannot sell an asset they do not hold. Letting a SHORT
+        # through here produced an entry order that Binance rejected with -2010
+        # on every cycle -- 428 rejections in 48 hours, and four of five symbols
+        # permanently stuck in that loop because their signal was almost always
+        # SHORT.
+        if direction == "SHORT" and not self.settings.shorting_available:
+            reasons.append(
+                "SHORT signals cannot be executed on a spot account "
+                "(set MARKET_TYPE=futures to enable, or the symbol stays long-only)"
+            )
+
+        if cooldown_reason:
+            reasons.append(cooldown_reason)
+
         if lstm_signal.confidence < threshold:
             suffix = f" ({lstm_signal.reason})" if lstm_signal.reason and lstm_signal.confidence == 0.0 else ""
             reasons.append(f"LSTM confidence {lstm_signal.confidence:.2f} below {threshold:.2f}{suffix}")
 
-        expected_action = "BUY" if direction == "LONG" else "SELL"
-        # A HOLD from an undertrained RL agent is tolerated in lab mode;
-        # an outright opposite call still vetoes.
-        rl_conflicts = (
-            rl_decision.action not in {expected_action, "HOLD"} if lab
-            else rl_decision.action != expected_action
-        )
-        if rl_conflicts:
-            reasons.append(f"RL action {rl_decision.action} does not match {expected_action}")
+        # A model can be 40% LONG / 38% SHORT and still clear a raw probability
+        # bar while holding no directional opinion at all. Margin is what
+        # separates an edge from a coin flip.
+        if lstm_signal.margin < min_margin:
+            reasons.append(
+                f"directional margin {lstm_signal.margin:.2f} below {min_margin:.2f} "
+                f"(LONG {lstm_signal.probabilities.get('LONG', 0):.2f} vs "
+                f"SHORT {lstm_signal.probabilities.get('SHORT', 0):.2f})"
+            )
 
-        if float(confluence.get("score", 0) or 0) < min_confluence:
-            reasons.append(f"multi-timeframe confluence below {min_confluence}")
-        if confluence.get("direction") not in {direction, None}:
+        min_quality = float(self.settings.min_model_quality)
+        if lstm_signal.model_quality < min_quality:
+            reasons.append(
+                f"model for {symbol} has out-of-sample directional precision "
+                f"{lstm_signal.model_quality:.2f}, below the {min_quality:.2f} minimum"
+            )
+
+        # RL vetoes only an outright contradiction. Requiring exact equality
+        # meant a HOLD -- the most common output of any well-trained agent --
+        # blocked every setup, which is how the system spent most of its life
+        # refusing to trade.
+        expected_action = "BUY" if direction == "LONG" else "SELL"
+        opposite_action = "SELL" if direction == "LONG" else "BUY"
+        if rl_decision.action == opposite_action and rl_decision.confidence >= float(self.settings.rl_veto_confidence):
+            reasons.append(
+                f"RL execution model calls {rl_decision.action} against a {direction} setup "
+                f"with {rl_decision.confidence:.2f} confidence"
+            )
+
+        if confluence_value < min_confluence:
+            reasons.append(f"multi-timeframe confluence {confluence_value:.0f} below {min_confluence:.0f}")
+        if confluence.get("direction") not in {direction, None, "NEUTRAL"}:
             reasons.append("multi-timeframe direction contradicts LSTM")
 
-        agreement = self._indicator_agreement(primary, direction)
         if agreement < min_agreement:
-            reasons.append(f"only {agreement} independent indicators agree")
+            reasons.append(f"only {agreement} independent indicators agree (need {min_agreement})")
 
         exceptional_confidence = (
-            lstm_signal.confidence >= 0.90
-            and rl_decision.confidence >= 0.90
-            and float(confluence.get("score", 0) or 0) >= 90
+            lstm_signal.confidence >= 0.80
             and rl_decision.action == expected_action
+            and rl_decision.confidence >= 0.70
+            and confluence_value >= 90
         )
         if await self._major_news_window(symbol, allow_degraded=exceptional_confidence):
             reasons.append("major news window within 30 minutes")
@@ -96,29 +150,34 @@ class ConfidenceGate:
         if bool(primary.get("atr_spike")):
             reasons.append("ATR is above 3x its 20-period average")
 
+        if float(self.settings.min_conviction) > 0 and conviction.value < float(self.settings.min_conviction):
+            reasons.append(f"conviction {conviction.value:.2f} below {float(self.settings.min_conviction):.2f}")
+
         if reasons:
-            return GateResult(False, "NO_TRADE", reasons[0], reasons, agreement)
-        return GateResult(True, direction, None, [], agreement)
+            return self._blocked(reasons, agreement, conviction)
+        return GateResult(True, direction, None, [], agreement, conviction.value, conviction.as_dict())
+
+    def _blocked(self, reasons: list[str], agreement: int, conviction: ConvictionScore) -> GateResult:
+        return GateResult(False, "NO_TRADE", reasons[0], reasons, agreement, conviction.value, conviction.as_dict())
 
     def _primary_latest(self, indicators: dict[str, Any]) -> dict[str, Any]:
         frames = indicators.get("timeframes", {})
-        for preferred in ("1h", "15m", "4h", "5m", "1m", "1d"):
+        for preferred in self.settings.timeframe_preference:
             if preferred in frames:
                 return frames[preferred].get("latest", {})
         if frames:
             return next(iter(frames.values())).get("latest", {})
         return indicators.get("latest", {})
 
-    def _confidence_threshold(self) -> float:
+    def _overrides(self) -> dict[str, Any]:
         override_path = self.settings.runtime_dir / "risk_overrides.json"
         if not override_path.exists():
-            return float(self.settings.confidence_threshold)
+            return {}
         try:
-            overrides = json.loads(override_path.read_text(encoding="utf-8"))
-            return float(overrides.get("confidence_threshold", self.settings.confidence_threshold))
+            return json.loads(override_path.read_text(encoding="utf-8"))
         except Exception as exc:
-            logger.warning(f"Confidence threshold override skipped: {exc}")
-            return float(self.settings.confidence_threshold)
+            logger.warning(f"Risk override read skipped: {exc}")
+            return {}
 
     def _indicator_agreement(self, latest: dict[str, Any], direction: str) -> int:
         if direction not in {"LONG", "SHORT"}:
@@ -144,8 +203,6 @@ class ConfidenceGate:
                     f"set; {'allowing degraded high-confidence trade' if allow_degraded else 'blocking setup'}"
                 )
                 return not allow_degraded
-            # No calendar feed configured and it isn't required: don't gate
-            # on news at all rather than silently vetoing every trade.
             return False
         if self._events_loaded_at and now - self._events_loaded_at < timedelta(hours=1):
             events = self._events_cache

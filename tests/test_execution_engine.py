@@ -15,6 +15,7 @@ class FakeClient:
         self.orders: list[dict] = []
         self.cancelled: list[str] = []
         self.current_price = Decimal("100")
+        self.free_base = Decimal("1000")
         self.open_orders: list[dict] = []
         self.filters = SymbolFilters(
             symbol="BTCUSDT",
@@ -26,6 +27,9 @@ class FakeClient:
 
     async def get_usdt_balance(self) -> Decimal:
         return Decimal("10000")
+
+    async def get_asset_free(self, asset: str) -> Decimal:
+        return self.free_base
 
     async def place_order(self, **kwargs):
         self.orders.append(kwargs)
@@ -89,8 +93,10 @@ def plan() -> TradePlan:
         quantity=Decimal("1"),
         entry_price=Decimal("100"),
         sl_price=Decimal("97"),
-        tp1_price=Decimal("106"),
-        tp2_price=Decimal("109"),
+        tp1_price=Decimal("103"),
+        tp2_price=Decimal("106"),
+        final_target_price=Decimal("112"),
+        initial_risk_per_unit=Decimal("3"),
         strategy_used="EMA",
         regime_at_entry="TRENDING_UP",
         indicator_state={"latest": {"atr_14": 2}},
@@ -196,6 +202,88 @@ def test_execution_rejects_min_notional_filter_violation() -> None:
     assert not result.accepted
     assert result.reason and "Filter violation" in result.reason
     assert fake.orders == []
+
+
+def test_sell_entry_rejected_when_base_asset_is_not_held() -> None:
+    """The -2010 loop: a SELL spends the base asset, not USDT."""
+    fake = FakeClient()
+    fake.free_base = Decimal("0")
+    engine = ExecutionEngine(fake, RiskManager())
+    short_plan = replace(plan(), direction="SHORT", sl_price=Decimal("103"), tp1_price=Decimal("97"), final_target_price=Decimal("88"))
+
+    result = run(engine.place_trade(short_plan))
+
+    assert not result.accepted
+    assert result.reason and "insufficient BTC to sell" in result.reason
+    assert fake.orders == []
+
+
+def test_winner_that_rolls_over_exits_in_profit() -> None:
+    """A trade in front that loses momentum is banked, not handed back."""
+    fake = FakeClient()
+    fake.current_price = Decimal("101")
+    risk = RiskManager()
+    trade_plan = plan()
+    risk.register_open_position(trade_plan)
+    journal = FakeJournal()
+    engine = ExecutionEngine(fake, risk, journal)  # type: ignore[arg-type]
+    engine.open_trades["BTCUSDT"] = ManagedTrade(trade_plan, "entry-1", remaining_quantity=trade_plan.quantity)
+    engine.update_market_context("BTCUSDT", {"atr_14": 2, "close": 101, "ema_9": 102, "macd_hist": -1})
+
+    run(engine._monitor_once())
+
+    assert "BTCUSDT" not in engine.open_trades
+    assert journal.exits[-1]["exit_reason"] == "REVERSAL"
+    assert risk.closed_trades[-1].pnl_usd > 0
+
+
+def test_profit_lock_arms_so_a_pullback_cannot_close_red() -> None:
+    risk = RiskManager()
+    trade_plan = plan()
+    risk.register_open_position(trade_plan)
+    engine = ExecutionEngine(FakeClient(), risk)
+
+    # Runs the stop forward at +1R, then checks it survives a retrace.
+    risk.update_protective_stop("BTCUSDT", Decimal("103"), Decimal("2"))
+    stop = risk.open_positions["BTCUSDT"].sl_price
+    assert stop > trade_plan.entry_price
+    assert engine._r_multiple(trade_plan, stop) > 0
+
+
+def test_tp1_scales_out_and_leaves_a_runner() -> None:
+    fake = FakeClient()
+    fake.current_price = Decimal("103")
+    risk = RiskManager()
+    trade_plan = plan()
+    risk.register_open_position(trade_plan)
+    journal = FakeJournal()
+    engine = ExecutionEngine(fake, risk, journal)  # type: ignore[arg-type]
+    engine.open_trades["BTCUSDT"] = ManagedTrade(trade_plan, "entry-1", remaining_quantity=trade_plan.quantity)
+    engine.update_market_context("BTCUSDT", {"atr_14": 2})
+
+    run(engine._monitor_once())
+
+    managed = engine.open_trades["BTCUSDT"]
+    assert "TP1" in managed.scaled_out
+    assert managed.remaining_quantity < trade_plan.quantity
+    assert managed.remaining_quantity > 0
+    assert journal.partials[-1]["reason"] == "TP1"
+
+
+def test_reconcile_labels_a_profitable_close_as_take_profit() -> None:
+    """The old code journalled every remote close as 'SL', including winners."""
+    fake = FakeClient()
+    fake.current_price = Decimal("106")
+    risk = RiskManager()
+    trade_plan = plan()
+    risk.register_open_position(trade_plan)
+    journal = FakeJournal()
+    engine = ExecutionEngine(fake, risk, journal)  # type: ignore[arg-type]
+    engine.open_trades["BTCUSDT"] = ManagedTrade(trade_plan, "entry-1", remaining_quantity=trade_plan.quantity)
+
+    run(engine.reconcile_orders())
+
+    assert journal.exits[-1]["exit_reason"] == "TP"
 
 
 def test_execution_rounds_order_to_symbol_filters() -> None:
