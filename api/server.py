@@ -11,11 +11,15 @@ the running bot.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
+import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -27,6 +31,11 @@ STATE_PATH = settings.trading_state_path
 RISK_OVERRIDE_PATH = settings.runtime_dir / "risk_overrides.json"
 CLOSE_REQUESTS_PATH = settings.runtime_dir / "close_requests.json"
 
+# Live prices for open-position P&L. Cached briefly so a burst of dashboard
+# refreshes doesn't hammer the ticker endpoint. Prices come from the same venue
+# the bot trades on, so unrealized P&L is consistent with the entry price.
+_PRICE_CACHE: dict[str, Any] = {"at": 0.0, "prices": {}}
+
 
 def _read_json(path: Any, default: dict[str, Any]) -> dict[str, Any]:
     if not path.exists():
@@ -35,6 +44,57 @@ def _read_json(path: Any, default: dict[str, Any]) -> dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
+
+
+async def _current_prices() -> dict[str, Decimal]:
+    """All symbol prices from the venue ticker, cached ~3s. Never raises."""
+    now = time.time()
+    if now - float(_PRICE_CACHE["at"]) < 3 and _PRICE_CACHE["prices"]:
+        return _PRICE_CACHE["prices"]
+    url = settings.binance_spot_base_url + "/api/v3/ticker/price"
+    try:
+        data = await asyncio.to_thread(lambda: requests.get(url, timeout=8).json())
+        prices = {
+            row["symbol"]: Decimal(str(row["price"]))
+            for row in data
+            if isinstance(row, dict) and row.get("symbol") and row.get("price")
+        }
+        if prices:
+            _PRICE_CACHE["prices"] = prices
+            _PRICE_CACHE["at"] = now
+        return _PRICE_CACHE["prices"]
+    except Exception:
+        return _PRICE_CACHE["prices"]  # serve last-known rather than blanking the UI
+
+
+def _with_live_pnl(row: dict[str, Any], prices: dict[str, Decimal]) -> dict[str, Any]:
+    """Attach current_price / market_value / unrealized_pnl / unrealized_pct.
+
+    Only for still-open rows; closed trades already carry realised pnl_usd. This
+    is what fills the dashboard's 'Now' and 'Unreal. P&L' columns so an operator
+    can see, live, whether each position is green or red.
+    """
+    row = dict(row)
+    if str(row.get("outcome")) != "OPEN":
+        return row
+    price = prices.get(row.get("symbol"))
+    try:
+        entry = Decimal(str(row.get("entry_price") or 0))
+        qty = Decimal(str(row.get("quantity") or 0))
+    except Exception:
+        return row
+    if price is None or entry <= 0 or qty <= 0:
+        return row
+    if str(row.get("direction")) == "SHORT":
+        pnl = (entry - price) * qty
+    else:
+        pnl = (price - entry) * qty
+    cost = entry * qty
+    row["current_price"] = str(price)
+    row["market_value"] = str(price * qty)
+    row["unrealized_pnl"] = str(pnl)
+    row["unrealized_pct"] = str((pnl / cost * Decimal("100")) if cost > 0 else Decimal("0"))
+    return row
 
 
 @asynccontextmanager
@@ -129,11 +189,15 @@ async def _safe_fetch_all(db: Database, statement: str, params: dict[str, Any] |
 @app.get("/api/overview")
 async def overview() -> dict[str, Any]:
     db = _db(app)
+    prices = await _current_prices()
+    trades = [_with_live_pnl(r, prices) for r in await _safe_fetch_all(db, "SELECT * FROM trades ORDER BY entry_time DESC LIMIT 50")]
+    open_positions = [
+        _with_live_pnl(r, prices)
+        for r in await _safe_fetch_all(db, "SELECT * FROM trades WHERE outcome = 'OPEN' ORDER BY entry_time DESC")
+    ]
     return {
-        "trades": await _safe_fetch_all(db, "SELECT * FROM trades ORDER BY entry_time DESC LIMIT 50"),
-        "open_positions": await _safe_fetch_all(
-            db, "SELECT * FROM trades WHERE outcome = 'OPEN' ORDER BY entry_time DESC"
-        ),
+        "trades": trades,
+        "open_positions": open_positions,
         "equity": await _safe_fetch_all(db, "SELECT * FROM equity_snapshots ORDER BY captured_at DESC LIMIT 300"),
         "events": await _safe_fetch_all(db, "SELECT * FROM system_events ORDER BY occurred_at DESC LIMIT 100"),
         "performance": await _safe_fetch_all(
