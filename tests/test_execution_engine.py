@@ -11,6 +11,8 @@ from utils.binance_client import OrderResult, SymbolFilters
 
 
 class FakeClient:
+    is_futures = False
+
     def __init__(self) -> None:
         self.orders: list[dict] = []
         self.cancelled: list[str] = []
@@ -44,6 +46,13 @@ class FakeClient:
 
     async def cancel_order(self, symbol: str, order_id: str):
         self.cancelled.append(order_id)
+        return True
+
+    async def cancel_all_orders(self, symbol: str):
+        for order in [o for o in self.open_orders if o.get("symbol") == symbol]:
+            oid = order.get("orderId")
+            if oid is not None:
+                self.cancelled.append(str(oid))
         return True
 
     async def get_open_orders(self, symbol=None):

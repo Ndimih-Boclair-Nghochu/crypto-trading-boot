@@ -113,8 +113,24 @@ class Settings:
     # --- venue -------------------------------------------------------------
     # "spot" or "futures". On spot there is nothing to sell, so SHORT setups are
     # rejected by the gate instead of being sent to Binance to be refused.
+    # Futures (USDT-M perpetuals) can go both ways, with leverage.
     market_type: str = field(default_factory=lambda: os.getenv("MARKET_TYPE", "spot").strip().lower())
     taker_fee_rate: float = field(default_factory=lambda: _float("TAKER_FEE_RATE", 0.001))
+
+    # Futures testnet uses a SEPARATE key pair from spot testnet (issued at
+    # testnet.binancefuture.com, not testnet.binance.vision). Fall back to the
+    # spot key only so a misconfiguration fails at the API with a clear auth
+    # error rather than crashing at startup.
+    binance_futures_api_key: str = field(
+        default_factory=lambda: os.getenv("BINANCE_FUTURES_API_KEY", "") or os.getenv("BINANCE_API_KEY", "")
+    )
+    binance_futures_secret: str = field(
+        default_factory=lambda: os.getenv("BINANCE_FUTURES_SECRET", "") or os.getenv("BINANCE_SECRET", "")
+    )
+    futures_leverage: int = field(default_factory=lambda: _int("FUTURES_LEVERAGE", 3))
+    # ISOLATED keeps each position's risk walled off from the rest of the
+    # wallet; CROSSED shares margin. ISOLATED is the safer default.
+    futures_margin_type: str = field(default_factory=lambda: os.getenv("FUTURES_MARGIN_TYPE", "ISOLATED").strip().upper())
 
     # --- signal quality ----------------------------------------------------
     lstm_min_margin: float = field(default_factory=lambda: _float("LSTM_MIN_MARGIN", 0.15))
@@ -211,8 +227,20 @@ class Settings:
             )
 
     @property
+    def is_futures(self) -> bool:
+        return self.market_type == "futures"
+
+    @property
     def shorting_available(self) -> bool:
         return self.market_type == "futures"
+
+    @property
+    def active_api_key(self) -> str:
+        return self.binance_futures_api_key if self.is_futures else self.binance_api_key
+
+    @property
+    def active_api_secret(self) -> str:
+        return self.binance_futures_secret if self.is_futures else self.binance_secret
 
     @property
     def timeframe_preference(self) -> tuple[str, ...]:

@@ -332,6 +332,26 @@ class TradingSystem:
 
     async def _write_equity_snapshot(self) -> None:
         try:
+            if settings.is_futures:
+                # A futures position is margin plus floating PnL, not a holding
+                # of the base asset, so the wallet's margin balance already IS
+                # total equity. Read it straight from the account.
+                margin_balance, unrealized = await self.client.get_futures_equity()
+                total_equity = margin_balance
+                balance = margin_balance - unrealized
+                open_pnl = unrealized
+                self.risk.circuit_breaker_hit(total_equity)
+                peak = self.risk.peak_equity if self.risk.peak_equity > 0 else total_equity
+                drawdown_pct = ((peak - total_equity) / peak * Decimal("100")) if peak > 0 else Decimal("0")
+                await self.journal.log_equity(
+                    balance_usdt=balance,
+                    open_pnl=open_pnl,
+                    total_equity=total_equity,
+                    peak_equity=peak,
+                    drawdown_pct=drawdown_pct,
+                )
+                return
+
             balance = await self.client.get_usdt_balance()
             # Equity is free USDT plus the market value of what the bot's own
             # positions hold. Adding only unrealised PnL omitted the cost basis,

@@ -148,10 +148,21 @@ class ExecutionEngine:
     async def _can_afford(self, symbol: str, side: str, quantity: Decimal, price: Decimal) -> str | None:
         """Pre-flight the balance in the asset actually being spent.
 
-        A SELL spends the base asset, not USDT. Checking only the USDT balance
-        let SHORT entries through to Binance, which refused every one of them
-        with -2010 while the loop retried on the next cycle, forever.
+        Futures: both sides spend USDT *margin* (notional / leverage), and a
+        SELL opens a short rather than needing coins to sell. Spot: a BUY spends
+        USDT, a SELL spends the base asset -- checking only USDT there let SHORT
+        entries through to Binance, which refused every one with -2010.
         """
+        if self.client.is_futures:
+            available = await self.client.get_usdt_balance()
+            if available <= 0:
+                return "USDT margin balance unavailable or zero"
+            leverage = Decimal(str(max(1, settings.futures_leverage)))
+            margin_needed = (quantity * price) / leverage
+            if margin_needed > available:
+                return f"insufficient margin: need {margin_needed:.2f} USDT at {leverage}x, have {available:.2f}"
+            return None
+
         if side == "BUY":
             balance = await self.client.get_usdt_balance()
             if balance <= 0:
@@ -227,9 +238,22 @@ class ExecutionEngine:
         side = "SELL" if plan.direction == "LONG" else "BUY"
         filters = await self.client.get_symbol_filters(plan.symbol or "")
         if filters:
-            quantity = filters.round_quantity(quantity)
             stop_price = filters.round_price(stop_price)
             target_price = filters.round_price(target_price)
+
+        # Futures brackets the position with two closePosition orders instead of
+        # a spot OCO. closePosition sizes to the live position, so it needs no
+        # quantity and stays correct as scale-outs shrink the position.
+        if self.client.is_futures:
+            return await self.client.place_futures_protection(
+                symbol=plan.symbol or "",
+                close_side=side,
+                stop_price=_fmt(stop_price),
+                target_price=_fmt(target_price),
+            )
+
+        if filters:
+            quantity = filters.round_quantity(quantity)
             ok, reason = filters.validate_order(target_price, quantity)
             if not ok:
                 return OrderResult(False, status="FILTER_REJECTED", reason=f"Filter violation: OCO {reason}")
@@ -275,10 +299,9 @@ class ExecutionEngine:
 
     async def _cancel_resting_orders(self, symbol: str) -> None:
         try:
-            for order in await self.client.get_open_orders(symbol):
-                order_id = order.get("orderId")
-                if order_id is not None:
-                    await self.client.cancel_order(symbol, str(order_id))
+            # One bulk cancel on futures; per-order on spot (cancel_all_orders
+            # falls back to a loop there).
+            await self.client.cancel_all_orders(symbol)
         except Exception as exc:
             logger.warning(f"{symbol}: could not cancel resting orders: {exc}")
 
@@ -483,6 +506,22 @@ class ExecutionEngine:
         if quantity <= 0:
             return ExecutionResult(False, reason="quantity <= 0")
         side = "SELL" if direction == "LONG" else "BUY"
+        if self.client.is_futures:
+            # Closing a long sells, closing a short buys -- reduceOnly guarantees
+            # the order can only shrink the position, never flip it. No
+            # base-asset balance to check: the position itself is the collateral.
+            filters = await self.client.get_symbol_filters(symbol)
+            if filters:
+                quantity = filters.round_quantity(quantity)
+                if filters.min_qty > 0 and quantity < filters.min_qty:
+                    return ExecutionResult(False, status="FILTER_REJECTED", reason=f"quantity {quantity} below minQty {filters.min_qty}")
+            if quantity <= 0:
+                return ExecutionResult(False, reason="quantity rounds to zero")
+            result = await self.client.place_order(
+                symbol=symbol, side=side, type="MARKET", quantity=_fmt(quantity), reduceOnly="true"
+            )
+            return ExecutionResult(result.accepted, result.order_id, result.status, result.reason, result.raw)
+
         if side == "SELL":
             free = await self.client.get_asset_free(_base_asset(symbol))
             if free < quantity:

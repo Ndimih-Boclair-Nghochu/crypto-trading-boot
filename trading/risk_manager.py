@@ -199,7 +199,17 @@ class RiskManager:
                 f"{total_risk_pct:.4f}%",
             )
         )
-        checklist.append(ChecklistItem("Binance account has sufficient balance", notional <= available, f"notional={notional}"))
+        # Spot must cover the whole notional; futures only the margin
+        # (notional / leverage). Using the spot rule on futures would reject
+        # every leveraged trade whose notional exceeds the wallet.
+        if getattr(self.settings, "is_futures", False):
+            leverage = _d(max(1, int(getattr(self.settings, "futures_leverage", 1))))
+            capital_needed = notional / leverage
+            capital_label = f"margin={capital_needed:.2f} at {leverage}x"
+        else:
+            capital_needed = notional
+            capital_label = f"notional={notional}"
+        checklist.append(ChecklistItem("Binance account has sufficient balance", capital_needed <= available, capital_label))
 
         failed = [item for item in checklist if not item.passed]
         if failed:
