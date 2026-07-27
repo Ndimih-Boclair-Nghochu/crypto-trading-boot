@@ -293,12 +293,12 @@ class ExecutionEngine:
         while True:
             try:
                 await self._monitor_once()
-                await asyncio.sleep(10)
+                await asyncio.sleep(float(settings.monitor_interval_seconds))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.exception(f"Execution monitor error: {exc}")
-                await asyncio.sleep(10)
+                await asyncio.sleep(float(settings.monitor_interval_seconds))
 
     async def _monitor_once(self) -> None:
         async with self.lock:
@@ -314,6 +314,14 @@ class ExecutionEngine:
                 risk = plan.initial_risk_per_unit or abs(plan.entry_price - plan.sl_price)
                 current_r = self._r_multiple(plan, price)
                 managed.peak_r = max(managed.peak_r, current_r)
+
+                # Peak-profit guard: once the trade has been at least
+                # PEAK_GUARD_ARM_R in front, never let it hand back more than
+                # PEAK_GUARD_GIVEBACK_PCT of that best gain. Checked before any
+                # other exit so a reversing winner is banked at market instantly.
+                if self._peak_guard_triggered(managed, current_r):
+                    await self._finalise(symbol, managed, price, "PEAK_GUARD")
+                    continue
 
                 new_stop = self.risk_manager.update_protective_stop(symbol, price, atr_value)
                 if new_stop and self._stop_moved(managed, new_stop, price):
@@ -341,6 +349,23 @@ class ExecutionEngine:
                     moved = abs(price - plan.entry_price) >= atr_value if atr_value > 0 else True
                     if not moved:
                         await self._finalise(symbol, managed, price, "TIME_STOP")
+
+    def _peak_guard_triggered(self, managed: ManagedTrade, current_r: Decimal) -> bool:
+        """True once a trade that reached a real peak gives back too much of it.
+
+        Measured in R (profit units), so 'give back 5% of the peak' means the
+        current profit dropped below 95% of the best profit the trade ever
+        showed. Only arms after peak_r >= arm_r so ordinary noise around
+        breakeven never trips it.
+        """
+        if not settings.peak_guard_enabled:
+            return False
+        arm_r = Decimal(str(settings.peak_guard_arm_r))
+        if managed.peak_r < arm_r or managed.peak_r <= 0:
+            return False
+        giveback = Decimal(str(settings.peak_guard_giveback_pct)) / Decimal("100")
+        floor_r = managed.peak_r * (Decimal("1") - giveback)
+        return current_r < floor_r
 
     def _stop_moved(self, managed: ManagedTrade, new_stop: Decimal, price: Decimal) -> bool:
         """Only rewrite the exchange order when the move is worth an API call."""
@@ -516,10 +541,16 @@ class ExecutionEngine:
     async def emergency_close_symbol(self, symbol: str) -> ExecutionResult:
         async with self.lock:
             managed = self.open_trades.get(symbol)
-            if not managed:
-                return ExecutionResult(False, reason="symbol not managed")
             price = await self._latest_price(symbol)
             await self._cancel_resting_orders(symbol)
+
+            if not managed:
+                # No local record -- typically a position opened before a
+                # restart, managed only by its exchange stop. The Stop button
+                # must still work, so flatten whatever the account actually
+                # holds on the exchange rather than reporting "not managed".
+                return await self._force_flatten_untracked(symbol, price)
+
             result = await self._close_quantity(symbol, managed.plan.direction or "", managed.remaining_quantity)
             if result.accepted:
                 exit_price = price if price > 0 else managed.plan.entry_price
@@ -531,6 +562,30 @@ class ExecutionEngine:
                     await self.journal.log_trade_exit(symbol, exit_price, "MANUAL")
                 await self.alerter.send(f"MANUAL CLOSE: {symbol}", {"reason": "MANUAL", "exit_price": str(exit_price)})
             return result
+
+    async def _force_flatten_untracked(self, symbol: str, price: Decimal) -> ExecutionResult:
+        """Sell whatever base asset the account holds for an untracked symbol.
+
+        Spot-only: a long position is simply a holding of the base asset, so
+        market-selling the free balance flattens it. Guarantees the Stop button
+        does something even for positions the bot never had in memory.
+        """
+        base = _base_asset(symbol)
+        free = await self.client.get_asset_free(base)
+        if free <= 0:
+            logger.info(f"Manual stop for {symbol}: nothing held on the exchange to close")
+            return ExecutionResult(False, reason=f"no {base} balance to close")
+        result = await self._close_quantity(symbol, "LONG", free)
+        if result.accepted and self.journal:
+            exit_price = price if price > 0 else Decimal("0")
+            await self.journal.log_event(
+                "MANUAL_CLOSE",
+                "INFO",
+                f"Force-flattened untracked {symbol} ({free} {base}) on manual stop",
+                {"symbol": symbol, "qty": str(free), "approx_price": str(exit_price)},
+            )
+            await self.alerter.send(f"MANUAL CLOSE (untracked): {symbol}", {"qty": str(free), "base": base})
+        return result
 
     # -------------------------------------------------------------- reconcile
 

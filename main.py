@@ -50,6 +50,9 @@ class TradingSystem:
         # primary timeframe the old loop re-scored an identical, unchanged
         # feature vector 120 times per candle.
         self._last_bar: dict[str, int] = {}
+        # Dedicated fast task so the Stop button acts within ~1s instead of
+        # waiting for the 30s analysis cycle to come around.
+        self._close_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         if not settings.use_testnet:
@@ -60,6 +63,10 @@ class TradingSystem:
         await self.journal.start()
         await self.client.initialize()
         self.client.start_health_check()
+        # Watch the manual-stop request file on a tight interval, independent of
+        # the main analysis loop, so pressing Stop closes the position promptly.
+        if self._close_task is None or self._close_task.done():
+            self._close_task = asyncio.create_task(self._close_request_loop(), name="close-watcher")
         await self.journal.log_event(
             "SYSTEM_START",
             "INFO",
@@ -148,10 +155,24 @@ class TradingSystem:
             heartbeat_task.cancel()
 
     async def stop(self) -> None:
+        if self._close_task:
+            self._close_task.cancel()
         await self.journal.log_event("SYSTEM_STOP", "INFO", "Trading system stopped", {})
         await self.journal.stop()
         await self.client.close()
         await database.close()
+
+    async def _close_request_loop(self) -> None:
+        """Poll the manual-stop file frequently so Stop acts near-instantly."""
+        interval = max(0.25, float(settings.close_poll_seconds))
+        while True:
+            try:
+                await self._process_close_requests()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(f"Close-request watcher error: {exc}")
+            await asyncio.sleep(interval)
 
     async def main_loop(self) -> None:
         try:
@@ -174,7 +195,8 @@ class TradingSystem:
                     for symbol in settings.symbols:
                         await self._evaluate_symbol(symbol, snapshot, meta)
 
-                    await self._process_close_requests()
+                    # Manual stops are handled by the dedicated fast watcher
+                    # (_close_request_loop); no need to poll them here too.
                     await self._write_equity_snapshot()
                     await self._handle_circuit_breaker()
 

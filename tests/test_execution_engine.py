@@ -186,6 +186,69 @@ def test_reconcile_cleans_stale_ghost_position() -> None:
     assert journal.events[-1]["event_type"] == "RECONCILE_CLOSE"
 
 
+def test_peak_guard_banks_a_winner_that_rolls_over() -> None:
+    """A trade that peaked at +1R and slipped back exits in profit, instantly."""
+    fake = FakeClient()
+    fake.current_price = Decimal("102")  # +0.67R now (entry 100, 1R = 3)
+    risk = RiskManager()
+    trade_plan = plan()
+    risk.register_open_position(trade_plan)
+    journal = FakeJournal()
+    engine = ExecutionEngine(fake, risk, journal)  # type: ignore[arg-type]
+    managed = ManagedTrade(trade_plan, "entry-1", remaining_quantity=trade_plan.quantity)
+    managed.peak_r = Decimal("1.0")  # it had been +1R in front
+    engine.open_trades["BTCUSDT"] = managed
+    engine.update_market_context("BTCUSDT", {"atr_14": 2})
+
+    run(engine._monitor_once())
+
+    assert "BTCUSDT" not in engine.open_trades
+    assert journal.exits[-1]["exit_reason"] == "PEAK_GUARD"
+    assert risk.closed_trades[-1].pnl_usd > 0  # banked while still green
+
+
+def test_peak_guard_does_not_fire_before_arming() -> None:
+    """A tiny wiggle near breakeven must not trip the guard."""
+    fake = FakeClient()
+    fake.current_price = Decimal("100.3")
+    risk = RiskManager()
+    trade_plan = plan()
+    risk.register_open_position(trade_plan)
+    engine = ExecutionEngine(fake, risk, FakeJournal())  # type: ignore[arg-type]
+    managed = ManagedTrade(trade_plan, "entry-1", remaining_quantity=trade_plan.quantity)
+    managed.peak_r = Decimal("0.2")  # never reached the 0.5R arm level
+    engine.open_trades["BTCUSDT"] = managed
+    engine.update_market_context("BTCUSDT", {"atr_14": 2})
+
+    run(engine._monitor_once())
+
+    assert "BTCUSDT" in engine.open_trades  # still open
+
+
+def test_manual_stop_flattens_untracked_position() -> None:
+    """The Stop button must work even for a position opened before a restart."""
+    fake = FakeClient()
+    fake.current_price = Decimal("105")
+    fake.free_base = Decimal("0.5")  # 0.5 BTC held on the exchange, not tracked
+    engine = ExecutionEngine(fake, RiskManager())  # empty open_trades
+
+    result = run(engine.emergency_close_symbol("BTCUSDT"))
+
+    assert result.accepted
+    assert any(o.get("side") == "SELL" and o.get("type") == "MARKET" for o in fake.orders)
+
+
+def test_manual_stop_untracked_with_nothing_held_is_safe() -> None:
+    fake = FakeClient()
+    fake.free_base = Decimal("0")
+    engine = ExecutionEngine(fake, RiskManager())
+
+    result = run(engine.emergency_close_symbol("BTCUSDT"))
+
+    assert not result.accepted
+    assert fake.orders == []
+
+
 def test_execution_rejects_min_notional_filter_violation() -> None:
     fake = FakeClient()
     fake.filters = SymbolFilters(

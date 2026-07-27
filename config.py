@@ -158,6 +158,22 @@ class Settings:
     reversal_exit_min_r: float = field(default_factory=lambda: _float("REVERSAL_EXIT_MIN_R", 0.15))
     time_stop_hours: float = field(default_factory=lambda: _float("TIME_STOP_HOURS", 8.0))
 
+    # Peak-profit guard: once a trade's profit has reached PEAK_GUARD_ARM_R (in
+    # R), track its high-water mark. If it then gives back more than
+    # PEAK_GUARD_GIVEBACK_PCT of that peak profit, close immediately at market.
+    # This is the "don't let a winner turn back into a loss" rule -- deliberately
+    # tight/sensitive. Raise the give-back to let winners breathe more; lower it
+    # to bank profit sooner.
+    peak_guard_enabled: bool = field(default_factory=lambda: _bool("PEAK_GUARD_ENABLED", True))
+    peak_guard_arm_r: float = field(default_factory=lambda: _float("PEAK_GUARD_ARM_R", 0.5))
+    peak_guard_giveback_pct: float = field(default_factory=lambda: _float("PEAK_GUARD_GIVEBACK_PCT", 5.0))
+    # How often the position monitor re-checks every open trade. Lower = the
+    # peak guard and stops react faster (at the cost of more price polls).
+    monitor_interval_seconds: float = field(default_factory=lambda: _float("MONITOR_INTERVAL_SECONDS", 4.0))
+    # How often the manual-stop request file is polled. A dedicated fast loop
+    # so the Stop button acts within a second or two, not on the 30s trade cycle.
+    close_poll_seconds: float = field(default_factory=lambda: _float("CLOSE_POLL_SECONDS", 1.0))
+
     # --- training / learning ----------------------------------------------
     # Testnet keeps only ~1100 hourly candles and prices them on its own
     # matching engine. Historical training therefore reads mainnet's public
