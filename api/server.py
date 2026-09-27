@@ -30,6 +30,7 @@ from db.connection import Database
 STATE_PATH = settings.trading_state_path
 RISK_OVERRIDE_PATH = settings.runtime_dir / "risk_overrides.json"
 CLOSE_REQUESTS_PATH = settings.runtime_dir / "close_requests.json"
+CONTROL_PATH = settings.runtime_dir / "control.json"
 
 # Live prices for open-position P&L. Cached briefly so a burst of dashboard
 # refreshes doesn't hammer the ticker endpoint. Prices come from the same venue
@@ -94,6 +95,20 @@ def _with_live_pnl(row: dict[str, Any], prices: dict[str, Decimal]) -> dict[str,
     row["market_value"] = str(price * qty)
     row["unrealized_pnl"] = str(pnl)
     row["unrealized_pct"] = str((pnl / cost * Decimal("100")) if cost > 0 else Decimal("0"))
+    # Expected outcome if the trade runs to its stop or its take-profit, in dollars,
+    # so the operator sees "makes +$X at TP / loses -$Y at SL" the moment it opens.
+    try:
+        sl = Decimal(str(row.get("sl_price") or 0))
+        if sl > 0:
+            risk_unit = abs(entry - sl)
+            row["expected_sl_usd"] = str(-(risk_unit * qty))
+            # Take-profit is the runner's final target (final_target_r_multiple x R),
+            # which is where the trade actually exits in pure TP/SL mode -- not the
+            # intermediate tp2 (2R). Show that so the figure matches the real target.
+            tp_r = Decimal(str(settings.final_target_r_multiple))
+            row["expected_tp_usd"] = str(risk_unit * tp_r * qty)
+    except Exception:
+        pass
     return row
 
 
@@ -167,6 +182,7 @@ async def health() -> dict[str, Any]:
         "testnet": settings.use_testnet,
         "binance_connected": bool(state.get("binance_connected", False)),
         "db_connected": db.sessionmaker is not None,
+        "paused": bool(_read_json(CONTROL_PATH, {"paused": False}).get("paused", False)),
         "updated_at": updated_at,
     }
 
@@ -186,19 +202,53 @@ async def _safe_fetch_all(db: Database, statement: str, params: dict[str, Any] |
         return []
 
 
+@app.get("/api/mode")
+async def mode() -> dict[str, Any]:
+    """Which venue the platform is on right now, and whether Live is unlocked.
+    The dashboard reads this to show the Demo/Live badge and gate the switch."""
+    return {
+        "mode": settings.mode,  # "demo" | "live"
+        "is_live": settings.is_live_mode,
+        "market_type": settings.market_type,  # "spot" | "futures"
+        "shorting_available": settings.shorting_available,
+        "futures_keys_configured": settings.futures_keys_configured,
+        "live_trading_allowed": settings.live_trading_allowed,
+        "live_trading_reviewed": settings.live_trading_reviewed,
+        "completed_trade_count": settings.completed_trade_count,
+        "min_live_trades": settings.min_live_trades,
+    }
+
+
 @app.get("/api/overview")
 async def overview() -> dict[str, Any]:
     db = _db(app)
     prices = await _current_prices()
-    trades = [_with_live_pnl(r, prices) for r in await _safe_fetch_all(db, "SELECT * FROM trades ORDER BY entry_time DESC LIMIT 50")]
+    # Only ever show the CURRENT mode's data: demo trades never bleed into the
+    # live dashboard and vice-versa. is_live is tagged on each row at write time.
+    is_live = settings.is_live_mode
+    trades = [
+        _with_live_pnl(r, prices)
+        for r in await _safe_fetch_all(
+            db, "SELECT * FROM trades WHERE is_live = :is_live ORDER BY entry_time DESC LIMIT 500", {"is_live": is_live}
+        )
+    ]
     open_positions = [
         _with_live_pnl(r, prices)
-        for r in await _safe_fetch_all(db, "SELECT * FROM trades WHERE outcome = 'OPEN' ORDER BY entry_time DESC")
+        for r in await _safe_fetch_all(
+            db,
+            "SELECT * FROM trades WHERE outcome = 'OPEN' AND is_live = :is_live ORDER BY entry_time DESC",
+            {"is_live": is_live},
+        )
     ]
     return {
         "trades": trades,
         "open_positions": open_positions,
-        "equity": await _safe_fetch_all(db, "SELECT * FROM equity_snapshots ORDER BY captured_at DESC LIMIT 300"),
+        "mode": settings.mode,
+        "equity": await _safe_fetch_all(
+            db,
+            "SELECT * FROM equity_snapshots WHERE is_live = :is_live ORDER BY captured_at DESC LIMIT 300",
+            {"is_live": is_live},
+        ),
         "events": await _safe_fetch_all(db, "SELECT * FROM system_events ORDER BY occurred_at DESC LIMIT 100"),
         "performance": await _safe_fetch_all(
             db,
@@ -285,3 +335,64 @@ async def model_status() -> dict[str, Any]:
         "market_type": settings.market_type,
         "shorting_available": settings.shorting_available,
     }
+
+
+@app.post("/api/system/stop")
+async def system_stop() -> dict[str, Any]:
+    """Global kill-switch: pause the engine and close every open trade now."""
+    CONTROL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONTROL_PATH.write_text(json.dumps({"paused": True}), encoding="utf-8")
+    CLOSE_REQUESTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CLOSE_REQUESTS_PATH.write_text(json.dumps({"symbols": [], "close_all": True}), encoding="utf-8")
+    return {"ok": True, "paused": True}
+
+
+@app.post("/api/system/resume")
+async def system_resume() -> dict[str, Any]:
+    """Resume trading after a global stop."""
+    CONTROL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONTROL_PATH.write_text(json.dumps({"paused": False}), encoding="utf-8")
+    return {"ok": True, "paused": False}
+
+
+# --- Demo <-> Live switch --------------------------------------------------
+# The API only QUEUES a mode change (writes a request file on the host-mounted
+# logs volume); a host-side watcher validates and applies it (.env edit + engine
+# restart). Live is guarded server-side: the exact phrase must be typed, futures
+# keys must be present, and the completed-trade gate must be met -- so this can
+# never arm real money by accident or without the deliberate confirmation.
+MODE_REQUEST_PATH = settings.base_dir / "logs" / "mode_request.json"
+GO_LIVE_PHRASE = "GO LIVE"
+
+
+class GoLiveBody(BaseModel):
+    confirm: str
+
+
+@app.post("/api/system/go-live")
+async def go_live(body: GoLiveBody) -> dict[str, Any]:
+    if body.confirm.strip() != GO_LIVE_PHRASE:
+        return {"ok": False, "error": 'Type GO LIVE exactly to confirm real-money trading.'}
+    if not settings.futures_keys_configured:
+        return {"ok": False, "error": "Futures API key is not configured on the server."}
+    if settings.completed_trade_count < settings.min_live_trades:
+        return {
+            "ok": False,
+            "error": f"Live is locked: need {settings.min_live_trades} completed trades "
+            f"(have {settings.completed_trade_count}).",
+        }
+    MODE_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MODE_REQUEST_PATH.write_text(
+        json.dumps({"target": "live", "ts": datetime.now(UTC).isoformat()}), encoding="utf-8"
+    )
+    return {"ok": True, "queued": "live", "note": "Switching to LIVE — the bot restarts in ~10s."}
+
+
+@app.post("/api/system/go-demo")
+async def go_demo() -> dict[str, Any]:
+    """Revert to DEMO — always safe, no confirmation required."""
+    MODE_REQUEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    MODE_REQUEST_PATH.write_text(
+        json.dumps({"target": "demo", "ts": datetime.now(UTC).isoformat()}), encoding="utf-8"
+    )
+    return {"ok": True, "queued": "demo", "note": "Switching to DEMO — the bot restarts in ~10s."}

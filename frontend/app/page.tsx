@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   api,
+  ModeInfo,
   Overview,
   RiskSettings,
   TradingState,
@@ -42,13 +43,21 @@ export default function Page() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [savingRisk, setSavingRisk] = useState(false);
   const [stopping, setStopping] = useState<Record<string, boolean>>({});
+  const [tradePage, setTradePage] = useState(0);
+  const [systemBusy, setSystemBusy] = useState(false);
+  const [modeInfo, setModeInfo] = useState<ModeInfo | null>(null);
+  const [showGoLive, setShowGoLive] = useState(false);
+  const [confirmText, setConfirmText] = useState("");
+  const [switching, setSwitching] = useState(false);
+  const [switchMsg, setSwitchMsg] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    const results = await Promise.allSettled([api.health(), api.overview()]);
-    const [healthResult, overviewResult] = results;
+    const results = await Promise.allSettled([api.health(), api.overview(), api.mode()]);
+    const [healthResult, overviewResult, modeResult] = results;
 
     if (healthResult.status === "fulfilled") setHealth(healthResult.value);
     if (overviewResult.status === "fulfilled") setOverview(overviewResult.value);
+    if (modeResult.status === "fulfilled") setModeInfo(modeResult.value);
 
     if (healthResult.status === "rejected" || overviewResult.status === "rejected") {
       setMissedPolls((n) => n + 1);
@@ -110,6 +119,24 @@ export default function Page() {
     }
   };
 
+  const handleSystemToggle = async () => {
+    const isPaused = health?.paused ?? !(health?.trading_enabled ?? true);
+    setSystemBusy(true);
+    try {
+      if (isPaused) {
+        await api.systemResume();
+      } else {
+        await api.systemStop();
+      }
+      setActionError(null);
+      await refresh();
+    } catch {
+      setActionError("Could not reach the system control endpoint — is the backend up?");
+    } finally {
+      setSystemBusy(false);
+    }
+  };
+
   const trades = overview?.trades ?? [];
   const openPositions = overview?.open_positions ?? [];
   const equity = overview?.equity ?? [];
@@ -117,6 +144,13 @@ export default function Page() {
   const events = overview?.events ?? [];
   const noTrade = overview?.no_trade ?? [];
   const symbols = overview?.symbols ?? [];
+
+  const TRADE_PAGE_SIZE = 12;
+  const tradePageCount = Math.max(1, Math.ceil(trades.length / TRADE_PAGE_SIZE));
+  const safeTradePage = Math.min(Math.max(tradePage, 0), tradePageCount - 1);
+  const pagedTrades = trades.slice(safeTradePage * TRADE_PAGE_SIZE, (safeTradePage + 1) * TRADE_PAGE_SIZE);
+  const tradeRangeStart = trades.length === 0 ? 0 : safeTradePage * TRADE_PAGE_SIZE + 1;
+  const tradeRangeEnd = Math.min((safeTradePage + 1) * TRADE_PAGE_SIZE, trades.length);
 
   const latestEquity = equity[0];
   const totalEquity = num(latestEquity?.total_equity);
@@ -132,6 +166,7 @@ export default function Page() {
 
   const status = health?.status ?? "—";
   const connected = missedPolls < 2;
+  const paused = health?.paused ?? !(health?.trading_enabled ?? true);
   const isError = connected && (status === "ERROR" || status === "UNRESPONSIVE");
   const dotClass = !connected ? "ticker__dot--down" : isError ? "ticker__dot--down" : status === "ANALYZING" ? "ticker__dot--live" : "ticker__dot--paused";
 
@@ -145,10 +180,60 @@ export default function Page() {
         ).slice(0, 6)
       : symbols.slice(0, 6).map((s) => ({ symbol: s }));
 
+  const doGoLive = async () => {
+    setSwitching(true);
+    setSwitchMsg(null);
+    try {
+      const r = await api.goLive(confirmText.trim());
+      if (r.ok) {
+        setSwitchMsg("Switching to LIVE — the bot is restarting (~10s). Watch the badge.");
+        setShowGoLive(false);
+        setConfirmText("");
+      } else {
+        setSwitchMsg(r.error || "Could not switch.");
+      }
+    } catch (e) {
+      setSwitchMsg(e instanceof Error ? e.message : "Request failed.");
+    } finally {
+      setSwitching(false);
+    }
+  };
+
+  const doGoDemo = async () => {
+    if (typeof window !== "undefined" && !window.confirm("Switch back to DEMO (paper money)? The bot will restart.")) return;
+    setSwitching(true);
+    setSwitchMsg(null);
+    try {
+      await api.goDemo();
+      setSwitchMsg("Switching to DEMO — the bot is restarting (~10s).");
+    } catch (e) {
+      setSwitchMsg(e instanceof Error ? e.message : "Request failed.");
+    } finally {
+      setSwitching(false);
+    }
+  };
+
+  const btnBase = {
+    padding: "9px 16px", borderRadius: 8, border: "1px solid #374151",
+    background: "#1f2937", color: "#e5e7eb", fontSize: 14, cursor: "pointer",
+  } as const;
+
   return (
     <>
       <div className="ticker">
-        <span className="ticker__brand">CRYPTO TRADING DESK</span>
+        <span className="ticker__brand">
+          <svg className="ticker__logo" viewBox="0 0 32 32" aria-hidden="true">
+            <rect x="1" y="1" width="30" height="30" rx="8" fill="url(#nbng)" />
+            <path d="M9 22V10l7 8V10M18 22l4-12M20 16h4" stroke="#05070d" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+            <defs>
+              <linearGradient id="nbng" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+                <stop stopColor="#4ade80" />
+                <stop offset="1" stopColor="#22d3ee" />
+              </linearGradient>
+            </defs>
+          </svg>
+          NBN CRYPTO TRADING DESK
+        </span>
         <span className="ticker__item">
           <span className={`ticker__dot ${dotClass}`} />
           {connected ? status : "API UNREACHABLE"}
@@ -161,7 +246,11 @@ export default function Page() {
         </span>
         <EquitySparkline values={sparkValues} positive={equityTrendPositive} />
         <span className="ticker__item">
-          {health?.testnet ? <span className="badge badge--amber">TESTNET</span> : <span className="badge badge--green">LIVE</span>}
+          {health?.testnet ? (
+            <span className="badge badge--amber">DEMO MODE</span>
+          ) : (
+            <span className="badge badge--red">● LIVE — REAL MONEY</span>
+          )}
         </span>
         <span className="ticker__item">
           {connected && health?.binance_connected ? (
@@ -176,7 +265,21 @@ export default function Page() {
       <div className="shell">
         <header className="page-head">
           <h1>Account overview</h1>
-          <p>Live status, positions, and risk controls for the autonomous trading bot. The bot trades continuously and has no manual on/off switch.</p>
+          <p>Live status, positions, and risk controls for the autonomous trading system.</p>
+          <div className="system-control">
+            <button
+              className={`sys-btn ${paused ? "sys-btn--resume" : "sys-btn--stop"}`}
+              onClick={handleSystemToggle}
+              disabled={systemBusy}
+            >
+              {systemBusy ? "Working…" : paused ? "▶  Resume system" : "■  Stop all & pause"}
+            </button>
+            <span className="sys-state">
+              {paused
+                ? "System paused — all trades closed, no new entries until you resume."
+                : "System live — trading enabled. One click halts everything."}
+            </span>
+          </div>
           {actionError && <p className="footer-note down">{actionError}</p>}
           {!connected && error && (
             <p className="footer-note down">{error} — retrying every {POLL_MS / 1000}s.</p>
@@ -257,6 +360,8 @@ export default function Page() {
                       <th>TP1</th>
                       <th>Qty</th>
                       <th>Unreal. P&amp;L</th>
+                      <th>At TP</th>
+                      <th>At SL</th>
                       <th>Opened</th>
                       <th>Action</th>
                     </tr>
@@ -274,6 +379,8 @@ export default function Page() {
                         <td className={p.unrealized_pnl != null ? (num(p.unrealized_pnl) >= 0 ? "up" : "down") : ""}>
                           {p.unrealized_pnl != null ? fmtSigned(p.unrealized_pnl) : "—"}
                         </td>
+                        <td className="up">{p.expected_tp_usd != null ? fmtSigned(p.expected_tp_usd) : "—"}</td>
+                        <td className="down">{p.expected_sl_usd != null ? fmtSigned(p.expected_sl_usd) : "—"}</td>
                         <td>{fmtTime(p.entry_time)}</td>
                         <td>
                           <button
@@ -325,48 +432,25 @@ export default function Page() {
           </div>
         </section>
 
-        <section className="grid">
-          <div className="card" style={{ gridColumn: "1 / -1" }}>
-            <h2>Why isn&rsquo;t the bot trading?</h2>
-            {noTrade.length === 0 ? (
-              <p className="empty">
-                No analysis has been logged yet. Once the bot completes its first cycle, an
-                explanation will appear here for every symbol it decided not to trade.
-              </p>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-                {Object.values(
-                  noTrade.reduce<Record<string, Overview["no_trade"][number]>>((acc, row) => {
-                    if (!acc[row.symbol]) acc[row.symbol] = row;
-                    return acc;
-                  }, {})
-                ).map((row) => (
-                  <div key={row.symbol} style={{ borderBottom: "1px solid var(--border)", paddingBottom: 12 }}>
-                    <div className="row" style={{ marginBottom: 4 }}>
-                      <strong style={{ fontFamily: "var(--mono)" }}>{row.symbol}</strong>
-                      <span className="footer-note">{fmtTime(row.logged_at)}</span>
-                    </div>
-                    <p style={{ margin: 0, fontSize: 13, lineHeight: 1.5, color: "var(--text)" }}>
-                      {row.analysis_notes ?? `Blocked: ${row.gate_failed ?? "no specific reason recorded"}.`}
-                    </p>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </section>
-
         <section className="grid--two">
           <div className="card">
-            <h2>Trade history</h2>
+            <div className="row" style={{ marginBottom: 6 }}>
+              <h2 style={{ margin: 0 }}>Trade history</h2>
+              <span className="footer-note">
+                {trades.length === 0
+                  ? "0 trades"
+                  : `${tradeRangeStart}–${tradeRangeEnd} of ${trades.length} trade${trades.length === 1 ? "" : "s"}`}
+              </span>
+            </div>
             {trades.length === 0 ? (
               <p className="empty">No trades recorded yet.</p>
             ) : (
+              <>
               <div className="table-wrap">
                 <table>
                   <thead>
                     <tr>
-                      <th>Time</th>
+                      <th>Date / Time</th>
                       <th>Symbol</th>
                       <th>Dir</th>
                       <th>Entry</th>
@@ -377,7 +461,7 @@ export default function Page() {
                     </tr>
                   </thead>
                   <tbody>
-                    {trades.slice(0, 12).map((t) => (
+                    {pagedTrades.map((t) => (
                       <tr key={t.trade_id ?? `${t.symbol}-${t.entry_time}`}>
                         <td>{fmtTime(t.entry_time)}</td>
                         <td>{t.symbol}</td>
@@ -402,6 +486,14 @@ export default function Page() {
                   </tbody>
                 </table>
               </div>
+              {tradePageCount > 1 && (
+                <div className="pager">
+                  <button className="btn pager__btn" disabled={safeTradePage === 0} onClick={() => setTradePage(safeTradePage - 1)}>‹ Prev</button>
+                  <span className="pager__info">Page {safeTradePage + 1} / {tradePageCount}</span>
+                  <button className="btn pager__btn" disabled={safeTradePage >= tradePageCount - 1} onClick={() => setTradePage(safeTradePage + 1)}>Next ›</button>
+                </div>
+              )}
+              </>
             )}
           </div>
 
@@ -581,7 +673,83 @@ export default function Page() {
             )}
           </div>
         </section>
+
+        <section className="panel" style={{ marginTop: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <strong>Trading mode</strong>
+                {modeInfo?.is_live ? (
+                  <span className="badge badge--red">● LIVE — REAL MONEY</span>
+                ) : (
+                  <span className="badge badge--amber">DEMO (paper money)</span>
+                )}
+              </div>
+              <div style={{ fontSize: 12, opacity: 0.7, marginTop: 6 }}>
+                Futures key: {modeInfo?.futures_keys_configured ? "set" : "missing"} · Completed trades:{" "}
+                {modeInfo ? `${modeInfo.completed_trade_count}/${modeInfo.min_live_trades}` : "—"}
+                {modeInfo && !modeInfo.is_live && " · switching Live trades real money"}
+              </div>
+            </div>
+            {modeInfo?.is_live ? (
+              <button style={btnBase} onClick={doGoDemo} disabled={switching}>
+                Return to Demo
+              </button>
+            ) : (
+              <button
+                style={{ ...btnBase, background: "#b91c1c", borderColor: "#b91c1c", color: "#fff" }}
+                onClick={() => { setShowGoLive(true); setSwitchMsg(null); setConfirmText(""); }}
+                disabled={switching}
+              >
+                Go Live →
+              </button>
+            )}
+          </div>
+          {switchMsg && <div style={{ marginTop: 10, fontSize: 13 }}>{switchMsg}</div>}
+        </section>
       </div>
+
+      {showGoLive && (
+        <div
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.65)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}
+          onClick={() => !switching && setShowGoLive(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{ background: "#0b1220", border: "1px solid #b91c1c", borderRadius: 12, padding: 24, maxWidth: 460, width: "90%", color: "#e5e7eb" }}
+          >
+            <h3 style={{ marginTop: 0, color: "#f87171" }}>⚠️ Switch to LIVE — real money</h3>
+            <p style={{ fontSize: 14, lineHeight: 1.5 }}>
+              This trades your <strong>real funds</strong> on futures, with leverage. Losses are real
+              and can liquidate your account, and the bot&apos;s edge is not yet proven. Only continue if
+              you accept full responsibility for real-money losses.
+            </p>
+            <p style={{ fontSize: 13, opacity: 0.85 }}>
+              Type <strong>GO&nbsp;LIVE</strong> to confirm:
+            </p>
+            <input
+              value={confirmText}
+              onChange={(e) => setConfirmText(e.target.value)}
+              placeholder="GO LIVE"
+              autoFocus
+              style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #374151", background: "#111827", color: "#fff", fontSize: 15, boxSizing: "border-box" }}
+            />
+            {switchMsg && <div style={{ marginTop: 10, color: "#f87171", fontSize: 13 }}>{switchMsg}</div>}
+            <div style={{ display: "flex", gap: 10, marginTop: 16, justifyContent: "flex-end" }}>
+              <button style={btnBase} onClick={() => setShowGoLive(false)} disabled={switching}>
+                Cancel
+              </button>
+              <button
+                style={{ ...btnBase, background: confirmText.trim() === "GO LIVE" ? "#b91c1c" : "#4b5563", borderColor: "transparent", color: "#fff", cursor: confirmText.trim() === "GO LIVE" ? "pointer" : "not-allowed" }}
+                onClick={doGoLive}
+                disabled={switching || confirmText.trim() !== "GO LIVE"}
+              >
+                {switching ? "Switching…" : "Confirm — Go Live"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }

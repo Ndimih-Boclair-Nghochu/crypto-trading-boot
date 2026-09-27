@@ -85,7 +85,30 @@ class TradingSystem:
                 "has nothing to sell. Set MARKET_TYPE=futures to trade both directions.",
                 settings.market_type,
             )
+        await self._adopt_open_positions()
         await self._ensure_models_trained()
+
+    async def _adopt_open_positions(self) -> None:
+        """Re-attach to positions still marked OPEN in the DB after a restart.
+
+        Without this, a position opened before a crash or redeploy keeps riding
+        on Binance with no local management, the reconciler flags its exchange
+        orders as unknown every cycle, and once it closes its row stays OPEN
+        forever and distorts the equity/P&L figures. Adoption rebuilds the
+        in-memory state, or records a clean exit for anything the exchange no
+        longer holds. Runs before training so management resumes immediately.
+        """
+        try:
+            rows = await database.fetch_all(
+                "SELECT * FROM trades WHERE outcome = 'OPEN' ORDER BY entry_time DESC"
+            )
+        except Exception as exc:
+            logger.warning(f"Could not load open trades for startup adoption: {exc}")
+            return
+        try:
+            await self.execution.adopt_open_positions(rows)
+        except Exception as exc:
+            logger.exception(f"Startup adoption failed: {exc}")
 
     async def _ensure_models_trained(self) -> None:
         """Train on first run, and whenever the saved models predate a schema change.
@@ -185,7 +208,8 @@ class TradingSystem:
             while True:
                 try:
                     if not self.trading_enabled():
-                        await self._set_status("PAUSED", reason="FORCE_TRADING_PAUSED is set")
+                        await self._set_status("PAUSED", reason="Trading is paused (Stop switch / FORCE_TRADING_PAUSED)")
+                        await self._update_trade_readiness()
                         await asyncio.sleep(5)
                         continue
 
@@ -198,6 +222,7 @@ class TradingSystem:
                     # Manual stops are handled by the dedicated fast watcher
                     # (_close_request_loop); no need to poll them here too.
                     await self._write_equity_snapshot()
+                    await self._update_trade_readiness()
                     await self._handle_circuit_breaker()
 
                     now = datetime.now(UTC)
@@ -282,6 +307,10 @@ class TradingSystem:
             await self.learning.record_state()
 
     async def _handle_circuit_breaker(self) -> None:
+        # Pure TP/SL mode: the drawdown circuit breaker is an event-based exit, so
+        # it is switched off entirely -- trades end only at SL or TP.
+        if settings.pure_tp_sl:
+            return
         if not (self.risk.circuit_breaker_active and self.execution.open_trades):
             return
         logger.critical("CIRCUIT BREAKER ACTIVE - emergency closing all positions")
@@ -305,11 +334,25 @@ class TradingSystem:
         if not path.exists():
             return
         try:
-            symbols = json.loads(path.read_text(encoding="utf-8")).get("symbols", [])
+            data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return
-        if not symbols:
+        symbols = data.get("symbols", []) or []
+        close_all = bool(data.get("close_all"))
+        if not symbols and not close_all:
             return
+        if close_all:
+            open_symbols = list(self.execution.open_trades.keys())
+            try:
+                await self.execution.emergency_close_all()
+                await self.journal.log_event(
+                    "STOP_ALL",
+                    "WARNING",
+                    f"Global stop: closing all open trades ({len(open_symbols)}) and pausing the system",
+                    {"symbols": open_symbols},
+                )
+            except Exception as exc:
+                logger.warning(f"Global close-all failed: {exc}")
         for symbol in symbols:
             try:
                 result = await self.execution.emergency_close_symbol(symbol)
@@ -362,7 +405,11 @@ class TradingSystem:
             for position in self.risk.open_positions.values():
                 current_price = await self._get_current_price(position.symbol)
                 if current_price <= 0:
-                    continue
+                    # Fall back to cost basis: a momentary price-fetch miss on a
+                    # freshly-opened position must NOT zero its value, or equity
+                    # collapses by the position's full notional and manufactures a
+                    # phantom drawdown that trips the circuit breaker on every trade.
+                    current_price = position.entry_price
                 if position.direction == "LONG":
                     holdings_value += position.quantity * current_price
                     open_pnl += position.quantity * (current_price - position.entry_price)
@@ -382,8 +429,33 @@ class TradingSystem:
         except Exception as exc:
             logger.warning(f"Equity snapshot failed: {exc}")
 
+    async def _update_trade_readiness(self) -> None:
+        """Write the real completed-trade count so the live-trading gate reflects
+        actual trades (manual closes included -- they were the system's entries),
+        instead of a static env value."""
+        try:
+            rows = await database.fetch_all("SELECT count(*) AS n FROM trades WHERE outcome <> 'OPEN'")
+            n = int(rows[0]["n"]) if rows else 0
+            path = settings.runtime_dir / "trade_readiness.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"completed": n}), encoding="utf-8")
+        except Exception as exc:
+            logger.warning(f"Trade-readiness update failed: {exc}")
+
     def trading_enabled(self) -> bool:
-        return os.getenv("FORCE_TRADING_PAUSED", "").strip().lower() not in {"1", "true", "yes"}
+        # Hard env override (needs a restart) still wins.
+        if os.getenv("FORCE_TRADING_PAUSED", "").strip().lower() in {"1", "true", "yes"}:
+            return False
+        # Live control file toggled by the dashboard's Stop-All / Resume button.
+        # Read every check so pausing/resuming takes effect within one loop tick,
+        # no restart required.
+        try:
+            control = json.loads((settings.runtime_dir / "control.json").read_text(encoding="utf-8"))
+            if bool(control.get("paused")):
+                return False
+        except Exception:
+            pass
+        return True
 
     async def _set_status(self, status: str, *, reason: str | None = None) -> None:
         path = settings.trading_state_path

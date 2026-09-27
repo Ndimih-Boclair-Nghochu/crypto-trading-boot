@@ -149,13 +149,40 @@ class RiskManager:
             checklist.append(ChecklistItem("Position size calculated and within limits", False, "invalid entry/ATR/balance"))
             return self._blocked("invalid price, ATR, or balance", checklist)
 
-        risk_per_unit = _d(self.settings.stop_atr_multiple) * atr_value
-        if risk_per_unit <= 0:
+        atr_risk = _d(self.settings.stop_atr_multiple) * atr_value
+        if atr_risk <= 0:
             return self._blocked("invalid stop distance", checklist)
 
         long = signal.direction == "LONG"
         sign = Decimal("1") if long else Decimal("-1")
-        sl_price = entry - sign * risk_per_unit
+
+        # Structure-aware stop: anchor the SL just beyond the nearest support
+        # (long) / resistance (short) so only a genuine level-break stops the
+        # trade, not ordinary noise. Fall back to the ATR stop, and only adopt a
+        # structural stop that sits a sane distance away (0.5x-2x the ATR stop) so
+        # it is neither hair-trigger tight nor recklessly wide. Risk-per-unit is
+        # then whatever the actual stop distance is, and TP levels scale from it.
+        sl_price = entry - sign * atr_risk
+        stop_level = _optional_decimal(candidate.next_support if long else candidate.next_resistance)
+        if stop_level is not None:
+            buffer = Decimal("0.25") * atr_value
+            struct_sl = stop_level - sign * buffer
+            struct_risk = abs(entry - struct_sl)
+            on_loss_side = struct_sl < entry if long else struct_sl > entry
+            if on_loss_side and Decimal("0.5") * atr_risk <= struct_risk <= Decimal("2.0") * atr_risk:
+                sl_price = struct_sl
+
+        risk_per_unit = abs(entry - sl_price)
+        # Floor the stop distance: in very low-volatility conditions the ATR /
+        # structural stop can land a fraction of a percent from entry, which gets
+        # picked off by ordinary noise and makes the dollar risk (and the trade)
+        # trivially small. Never place the stop closer than STOP_MIN_PCT of price.
+        min_dist = entry * _d(self.settings.stop_min_pct) / Decimal("100")
+        if min_dist > 0 and risk_per_unit < min_dist:
+            risk_per_unit = min_dist
+            sl_price = entry - sign * min_dist
+        if risk_per_unit <= 0:
+            return self._blocked("invalid stop distance", checklist)
         tp1_price = entry + sign * _d(self.settings.tp1_r_multiple) * risk_per_unit
         tp2_price = entry + sign * _d(self.settings.tp2_r_multiple) * risk_per_unit
         final_target = entry + sign * _d(self.settings.final_target_r_multiple) * risk_per_unit
@@ -170,12 +197,13 @@ class RiskManager:
                 final_target = structural
 
         reward_risk = abs(final_target - entry) / risk_per_unit
+        min_rr = _d(self.settings.min_reward_risk)
         checklist.append(ChecklistItem("Stop loss set and valid", sl_price > 0, str(sl_price)))
-        checklist.append(ChecklistItem("Final target at least 2R", reward_risk >= Decimal("2"), f"{reward_risk:.2f}R"))
+        checklist.append(ChecklistItem(f"Final target at least {min_rr:.1f}R", reward_risk >= min_rr, f"{reward_risk:.2f}R"))
         if sl_price <= 0:
             return self._blocked("invalid stop loss", checklist)
-        if reward_risk < Decimal("2"):
-            return self._blocked("final target below 2R", checklist)
+        if reward_risk < min_rr:
+            return self._blocked(f"final target below {min_rr:.1f}R", checklist)
 
         risk_pct = self._risk_pct_for_conviction(conviction)
         quantity = self._position_size(balance, entry, risk_per_unit, risk_pct)
@@ -450,6 +478,11 @@ class RiskManager:
         else:
             self.peak_equity = max(self.peak_equity, equity)
         if self.peak_equity <= 0:
+            return
+        # Pure TP/SL mode disables the drawdown circuit breaker entirely: it must
+        # neither close trades nor block new entries. Keep it disarmed.
+        if self.settings.pure_tp_sl:
+            self.circuit_breaker_active = False
             return
         drawdown_pct = (self.peak_equity - equity) / self.peak_equity * Decimal("100")
         if drawdown_pct >= _d(self.settings.drawdown_circuit_breaker_pct):

@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Any
 
 from analysis.narrative import build_no_trade_narrative
+from config import settings
 from db.connection import Database, database
 from trading.risk_manager import TradePlan
 from trading.strategy_engine import TradeSignal
@@ -162,11 +163,11 @@ class Journal:
                         INSERT INTO trades (
                             symbol, direction, entry_price, sl_price, tp1_price, tp2_price, quantity,
                             entry_time, strategy_used, regime_at_entry, lstm_confidence, rl_confidence,
-                            confluence_score, outcome, binance_order_id
+                            confluence_score, outcome, binance_order_id, is_live
                         ) VALUES (
                             :symbol, :direction, :entry_price, :sl_price, :tp1_price, :tp2_price, :quantity,
                             :entry_time, :strategy_used, :regime_at_entry, :lstm_confidence, :rl_confidence,
-                            :confluence_score, 'OPEN', :binance_order_id
+                            :confluence_score, 'OPEN', :binance_order_id, :is_live
                         )
                         RETURNING trade_id
                         """
@@ -186,6 +187,7 @@ class Journal:
                         "rl_confidence": plan.rl_confidence,
                         "confluence_score": plan.confluence_score,
                         "binance_order_id": payload["binance_order_id"],
+                        "is_live": settings.is_live_mode,
                     },
                 )
                 trade_id = result.scalar_one()
@@ -306,10 +308,10 @@ class Journal:
     async def _write_equity(self, payload: dict[str, Any]) -> None:
         await self.db.execute(
             """
-            INSERT INTO equity_snapshots (balance_usdt, open_pnl, total_equity, peak_equity, drawdown_pct)
-            VALUES (:balance_usdt, :open_pnl, :total_equity, :peak_equity, :drawdown_pct)
+            INSERT INTO equity_snapshots (balance_usdt, open_pnl, total_equity, peak_equity, drawdown_pct, is_live)
+            VALUES (:balance_usdt, :open_pnl, :total_equity, :peak_equity, :drawdown_pct, :is_live)
             """,
-            payload,
+            {**payload, "is_live": settings.is_live_mode},
         )
 
     async def _write_system_event(self, payload: dict[str, Any]) -> None:

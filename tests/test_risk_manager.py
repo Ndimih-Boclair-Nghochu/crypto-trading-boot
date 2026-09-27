@@ -43,7 +43,8 @@ def candidate(conviction: float = 0.0, **kwargs) -> TradeCandidate:
 def sizing_settings(**kwargs) -> Settings:
     # max_position_pct is lifted so the risk-based leg of the sizing calculation
     # binds rather than the notional cap; the cap is exercised separately.
-    base = {"max_position_pct": 100.0, "max_risk_per_trade_pct": 1.5}
+    base = {"max_position_pct": 100.0, "max_risk_per_trade_pct": 1.5, "risk_min_pct": 0.25, "risk_max_pct": 1.25,
+            "final_target_r_multiple": 4.0, "pure_tp_sl": False}
     base.update(kwargs)
     return Settings(**base)
 

@@ -64,9 +64,17 @@ class StrategyEngine:
         regime = self.classify_regime(analysis_payload, fear_greed=fear_greed)
         strategy, secondary_check = self.select_strategy(regime)
         confluence_score = float(analysis_payload.get("confluence", {}).get("score", 0) or 0)
+        # Only take proven-profitable setups: if this regime's strategy has been
+        # disabled (negative historical expectancy), force a NO_TRADE regardless
+        # of the gate, so the bot concentrates on its winners.
+        disabled = strategy.upper() in self.settings.disabled_strategies
+        approved = gate.approved and not disabled
+        reasons = list(gate.reasons)
+        if disabled:
+            reasons.append(f"Strategy {strategy} disabled (negative historical expectancy)")
         return TradeSignal(
             symbol=symbol,
-            direction=gate.direction if gate.approved else "NO_TRADE",
+            direction=gate.direction if approved else "NO_TRADE",
             strategy_used=strategy,
             regime_at_entry=str(regime.value),
             lstm_confidence=lstm_signal.confidence,
@@ -85,7 +93,7 @@ class StrategyEngine:
                 "secondary_check": secondary_check,
                 "raw_candles": primary_frame.get("series_tail", [])[-120:],
             },
-            reasons=gate.reasons,
+            reasons=reasons,
             conviction=gate.conviction,
         )
 

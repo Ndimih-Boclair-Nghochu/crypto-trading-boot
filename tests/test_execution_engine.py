@@ -5,9 +5,21 @@ from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
+from config import settings as _base_settings
 from trading.execution_engine import ExecutionEngine, ManagedTrade
 from trading.risk_manager import RiskManager, TradePlan
 from utils.binance_client import OrderResult, SymbolFilters
+
+
+@pytest.fixture(autouse=True)
+def _full_exit_stack(monkeypatch):
+    # These tests exercise the full event-based exit stack (peak-guard, scale-outs,
+    # breakeven, profit-floor). Production may run with PURE_TP_SL=true, which
+    # disables all of them; force it off here so the non-pure paths are tested.
+    # The dedicated pure-mode test flips it back on for itself.
+    monkeypatch.setattr("trading.execution_engine.settings", replace(_base_settings, pure_tp_sl=False))
 
 
 class FakeClient:
@@ -234,6 +246,56 @@ def test_peak_guard_does_not_fire_before_arming() -> None:
     assert "BTCUSDT" in engine.open_trades  # still open
 
 
+def test_profit_floor_banks_a_proven_trade_that_reverses(monkeypatch) -> None:
+    """A trade that reached +0.3R then fell back to the +0.05R floor exits as a
+    small win -- the loss-side fix for the inverted payoff. Peak guard (arm 0.5R)
+    cannot fire here because the trade only peaked at 0.4R, so the floor owns it."""
+    from config import settings as _settings
+
+    cfg = replace(_settings, profit_floor_enabled=True, profit_floor_arm_r=0.3, profit_floor_r=0.05, pure_tp_sl=False)
+    monkeypatch.setattr("trading.execution_engine.settings", cfg)
+    fake = FakeClient()
+    fake.current_price = Decimal("100.15")  # +0.05R (entry 100, 1R = 3)
+    risk = RiskManager()
+    trade_plan = plan()
+    risk.register_open_position(trade_plan)
+    journal = FakeJournal()
+    engine = ExecutionEngine(fake, risk, journal)  # type: ignore[arg-type]
+    managed = ManagedTrade(trade_plan, "entry-1", remaining_quantity=trade_plan.quantity)
+    managed.peak_r = Decimal("0.4")  # had proven itself past the 0.3R arm
+    engine.open_trades["BTCUSDT"] = managed
+    engine.update_market_context("BTCUSDT", {"atr_14": 2})
+
+    run(engine._monitor_once())
+
+    assert "BTCUSDT" not in engine.open_trades
+    assert journal.exits[-1]["exit_reason"] == "PROFIT_FLOOR"
+    assert risk.closed_trades[-1].pnl_usd > 0  # banked a small gain, not a -1R loss
+
+
+def test_profit_floor_does_not_fire_before_arming(monkeypatch) -> None:
+    """A trade that never reached the 0.3R arm keeps its full stop -- the floor
+    must not clamp a trade that has not yet proved itself."""
+    from config import settings as _settings
+
+    cfg = replace(_settings, profit_floor_enabled=True, profit_floor_arm_r=0.3, profit_floor_r=0.05, pure_tp_sl=False)
+    monkeypatch.setattr("trading.execution_engine.settings", cfg)
+    fake = FakeClient()
+    fake.current_price = Decimal("100.15")  # +0.05R, but never armed
+    risk = RiskManager()
+    trade_plan = plan()
+    risk.register_open_position(trade_plan)
+    engine = ExecutionEngine(fake, risk, FakeJournal())  # type: ignore[arg-type]
+    managed = ManagedTrade(trade_plan, "entry-1", remaining_quantity=trade_plan.quantity)
+    managed.peak_r = Decimal("0.2")  # below the 0.3R arm
+    engine.open_trades["BTCUSDT"] = managed
+    engine.update_market_context("BTCUSDT", {"atr_14": 2})
+
+    run(engine._monitor_once())
+
+    assert "BTCUSDT" in engine.open_trades  # still open
+
+
 def test_manual_stop_flattens_untracked_position() -> None:
     """The Stop button must work even for a position opened before a restart."""
     fake = FakeClient()
@@ -376,3 +438,45 @@ def test_execution_rounds_order_to_symbol_filters() -> None:
     assert fake.orders[0]["price"] == "100"
     if engine._monitor_task:
         engine._monitor_task.cancel()
+
+
+def test_pure_tp_sl_ignores_events_exits_only_at_sl_or_tp(monkeypatch) -> None:
+    """PURE_TP_SL: no event exit fires. A winner that rolled back but is still
+    between SL (97) and TP (112) stays OPEN; it closes only at SL or the target."""
+    monkeypatch.setattr("trading.execution_engine.settings", replace(_base_settings, pure_tp_sl=True))
+
+    # 1) rolled-over winner, price 105 -- peak-guard/scale-outs would have closed it,
+    #    but pure mode leaves it open.
+    fake = FakeClient()
+    fake.current_price = Decimal("105")
+    risk = RiskManager()
+    tp = plan()
+    risk.register_open_position(tp)
+    engine = ExecutionEngine(fake, risk, FakeJournal())  # type: ignore[arg-type]
+    m = ManagedTrade(tp, "e1", remaining_quantity=tp.quantity)
+    m.peak_r = Decimal("2.5")  # had been well in front
+    engine.open_trades["BTCUSDT"] = m
+    engine.update_market_context("BTCUSDT", {"atr_14": 2})
+    run(engine._monitor_once())
+    assert "BTCUSDT" in engine.open_trades  # nothing closed it
+
+    # 2) price hits the take-profit target -> closes as TP.
+    fake.current_price = Decimal("113")
+    run(engine._monitor_once())
+    assert "BTCUSDT" not in engine.open_trades
+    assert engine.risk_manager.closed_trades[-1].pnl_usd > 0
+
+
+def test_pure_tp_sl_closes_at_stop_loss(monkeypatch) -> None:
+    monkeypatch.setattr("trading.execution_engine.settings", replace(_base_settings, pure_tp_sl=True))
+    fake = FakeClient()
+    fake.current_price = Decimal("96")  # below SL 97
+    risk = RiskManager()
+    tp = plan()
+    risk.register_open_position(tp)
+    journal = FakeJournal()
+    engine = ExecutionEngine(fake, risk, journal)  # type: ignore[arg-type]
+    engine.open_trades["BTCUSDT"] = ManagedTrade(tp, "e1", remaining_quantity=tp.quantity)
+    run(engine._monitor_once())
+    assert "BTCUSDT" not in engine.open_trades
+    assert journal.exits[-1]["exit_reason"] == "SL"

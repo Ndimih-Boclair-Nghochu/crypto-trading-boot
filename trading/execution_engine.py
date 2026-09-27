@@ -8,7 +8,7 @@ from typing import Any
 
 from config import settings
 from learning.journal import Journal
-from trading.risk_manager import RiskManager, TradePlan
+from trading.risk_manager import OpenPosition, RiskManager, TradePlan
 from utils.alerts import AlertManager
 from utils.binance_client import OrderResult, ResilientBinanceClient
 from utils.logger import logger
@@ -127,6 +127,8 @@ class ExecutionEngine:
                 )
                 if self.journal:
                     await self.journal.log_trade_open(plan, entry_order_id)
+                expected_at_sl = abs(plan.entry_price - plan.sl_price) * plan.quantity
+                expected_at_tp = abs(plan.final_target_price - plan.entry_price) * plan.quantity
                 await self.alerter.send(
                     f"TRADE OPENED: {plan.symbol} {plan.direction}",
                     {
@@ -137,6 +139,8 @@ class ExecutionEngine:
                         "size": str(plan.quantity),
                         "risk_pct": f"{plan.risk_pct:.3f}%",
                         "conviction": f"{plan.conviction:.2f}",
+                        "expected_at_tp": f"+${expected_at_tp:.2f}",
+                        "expected_at_sl": f"-${expected_at_sl:.2f}",
                     },
                 )
                 self.start_monitoring()
@@ -325,53 +329,117 @@ class ExecutionEngine:
 
     async def _monitor_once(self) -> None:
         async with self.lock:
+            # Each open trade is managed in isolation: a data glitch or exchange
+            # error on one symbol can never skip the peak-guard / exit checks on
+            # the others in the same tick.
             for symbol, managed in list(self.open_trades.items()):
-                plan = managed.plan
-                direction = plan.direction or ""
-                price = await self._latest_price(symbol)
-                if price <= 0:
-                    continue
+                try:
+                    await self._manage_symbol(symbol, managed)
+                except Exception as exc:
+                    logger.warning(
+                        f"Monitor: error managing {symbol}; other open trades are unaffected: {exc}"
+                    )
 
-                context = self.market_context.get(symbol, {}) or plan.indicator_state.get("latest", {})
-                atr_value = _decimal(context.get("atr_14"), Decimal("0"))
-                risk = plan.initial_risk_per_unit or abs(plan.entry_price - plan.sl_price)
-                current_r = self._r_multiple(plan, price)
-                managed.peak_r = max(managed.peak_r, current_r)
+    async def _manage_symbol(self, symbol: str, managed: ManagedTrade) -> None:
+        plan = managed.plan
+        direction = plan.direction or ""
+        price = await self._latest_price(symbol)
+        if price <= 0:
+            return
 
-                # Peak-profit guard: once the trade has been at least
-                # PEAK_GUARD_ARM_R in front, never let it hand back more than
-                # PEAK_GUARD_GIVEBACK_PCT of that best gain. Checked before any
-                # other exit so a reversing winner is banked at market instantly.
-                if self._peak_guard_triggered(managed, current_r):
-                    await self._finalise(symbol, managed, price, "PEAK_GUARD")
-                    continue
+        context = self.market_context.get(symbol, {}) or plan.indicator_state.get("latest", {})
+        atr_value = _decimal(context.get("atr_14"), Decimal("0"))
+        risk = plan.initial_risk_per_unit or abs(plan.entry_price - plan.sl_price)
+        current_r = self._r_multiple(plan, price)
+        managed.peak_r = max(managed.peak_r, current_r)
 
-                new_stop = self.risk_manager.update_protective_stop(symbol, price, atr_value)
-                if new_stop and self._stop_moved(managed, new_stop, price):
-                    await self._replace_protection(managed, new_stop, managed.protective_target or plan.final_target_price)
+        # Catastrophic backstop: no trade may lose more than MAX_LOSS_R, ever. This
+        # is the last line of defence for when the exchange stop was blown through
+        # on a fast move, or a position was held past its stop -- it force-closes
+        # at market so a single trade can never become a multi-R disaster. Checked
+        # before every other exit.
+        if current_r <= -Decimal(str(settings.max_loss_r)):
+            await self._finalise(symbol, managed, price, "SL")
+            return
 
-                stop_price = new_stop or managed.protective_stop or plan.sl_price
-                if self._stop_hit(direction, price, stop_price):
-                    reason = "PROFIT_LOCK" if current_r > 0 else ("TRAIL" if managed.peak_r > 0 else "SL")
-                    await self._finalise(symbol, managed, price, reason)
-                    continue
+        # PURE TP/SL MODE: the trade ends ONLY at its fixed stop-loss or its
+        # take-profit target -- no peak-guard, breakeven, profit-floor, trailing,
+        # reversal, time-stop or scale-outs. Winners run to TP; losers stop at SL.
+        if settings.pure_tp_sl:
+            if self._stop_hit(direction, price, plan.sl_price):
+                await self._finalise(symbol, managed, price, "SL")
+                return
+            if self._target_hit(direction, price, managed.protective_target or plan.final_target_price):
+                await self._finalise(symbol, managed, price, "TP")
+                return
+            return
 
-                if await self._take_scale_outs(symbol, managed, price, risk):
-                    continue
+        # Peak-profit guard: once the trade has been at least PEAK_GUARD_ARM_R in
+        # front, never let it hand back more than PEAK_GUARD_GIVEBACK_PCT of that
+        # best gain. Checked before any other exit so a reversing winner is banked
+        # at market instantly.
+        if self._peak_guard_triggered(managed, current_r):
+            await self._finalise(symbol, managed, price, "PEAK_GUARD")
+            return
 
-                if self._reversal_detected(direction, context, current_r):
-                    await self._finalise(symbol, managed, price, "REVERSAL")
-                    continue
+        # Profit floor: once a trade has ever been at least PROFIT_FLOOR_ARM_R in
+        # front, it may never come back to a loss -- if it drifts back down to the
+        # small locked PROFIT_FLOOR_R gain, bank it at market. Checked after the
+        # peak guard (which owns the high side) but before the stop, so a proven
+        # trade that reverses exits as a small win instead of riding to a full -1R.
+        # This is the loss-side half of correcting the inverted win/loss payoff.
+        if settings.profit_floor_enabled:
+            floor_arm = Decimal(str(settings.profit_floor_arm_r))
+            floor_r = Decimal(str(settings.profit_floor_r))
+            if floor_arm > 0 and managed.peak_r >= floor_arm and current_r <= floor_r:
+                await self._finalise(symbol, managed, price, "PROFIT_FLOOR")
+                return
 
-                if self._target_hit(direction, price, managed.protective_target or plan.final_target_price):
-                    await self._finalise(symbol, managed, price, "TP_FINAL")
-                    continue
+        new_stop = self.risk_manager.update_protective_stop(symbol, price, atr_value)
+        if new_stop and self._stop_moved(managed, new_stop, price):
+            await self._replace_protection(managed, new_stop, managed.protective_target or plan.final_target_price)
 
-                age = datetime.now(UTC) - managed.opened_at
-                if age >= timedelta(hours=float(settings.time_stop_hours)):
-                    moved = abs(price - plan.entry_price) >= atr_value if atr_value > 0 else True
-                    if not moved:
-                        await self._finalise(symbol, managed, price, "TIME_STOP")
+        stop_price = new_stop or managed.protective_stop or plan.sl_price
+        # Breakeven-lock: once the trade has ever cleared BREAKEVEN_ARM_R of profit
+        # (net of round-trip fees), never let its protective stop sit below
+        # breakeven+fees — so a trade that has genuinely gone into profit can no
+        # longer come back to a loss. Only trades that never cleared that buffer
+        # (i.e. went red from the start) can still lose.
+        arm = Decimal(str(settings.breakeven_arm_r))
+        if settings.breakeven_enabled and arm > 0 and managed.peak_r >= arm:
+            fee_buf = plan.entry_price * Decimal("2") * Decimal(str(settings.taker_fee_rate))
+            if direction == "LONG":
+                stop_price = max(stop_price, plan.entry_price + fee_buf)
+            else:
+                be = plan.entry_price - fee_buf
+                stop_price = be if stop_price <= 0 else min(stop_price, be)
+        if self._stop_hit(direction, price, stop_price):
+            exit_r = self._r_multiple(plan, price)
+            if exit_r > 0:
+                reason = "PROFIT_LOCK" if managed.peak_r >= Decimal(str(settings.peak_guard_arm_r)) else "BREAKEVEN"
+            elif managed.peak_r > 0:
+                reason = "TRAIL"
+            else:
+                reason = "SL"
+            await self._finalise(symbol, managed, price, reason)
+            return
+
+        if await self._take_scale_outs(symbol, managed, price, risk):
+            return
+
+        if self._reversal_detected(direction, context, current_r):
+            await self._finalise(symbol, managed, price, "REVERSAL")
+            return
+
+        if self._target_hit(direction, price, managed.protective_target or plan.final_target_price):
+            await self._finalise(symbol, managed, price, "TP_FINAL")
+            return
+
+        age = datetime.now(UTC) - managed.opened_at
+        if age >= timedelta(hours=float(settings.time_stop_hours)):
+            moved = abs(price - plan.entry_price) >= atr_value if atr_value > 0 else True
+            if not moved:
+                await self._finalise(symbol, managed, price, "TIME_STOP")
 
     def _peak_guard_triggered(self, managed: ManagedTrade, current_r: Decimal) -> bool:
         """True once a trade that reached a real peak gives back too much of it.
@@ -686,6 +754,197 @@ class ExecutionEngine:
             return "SL"
         return "TRAIL"
 
+    # ----------------------------------------------------------------- adoption
+
+    async def adopt_open_positions(self, open_rows: list[dict[str, Any]]) -> None:
+        """Re-attach to positions the DB still lists as OPEN after a restart.
+
+        A fresh process starts with empty ``open_trades`` and ``open_positions``
+        while Binance still holds the coins and the resting protective orders.
+        Without re-adoption those positions ride completely unmanaged (no trail,
+        no peak-guard, no time-stop), the reconciler flags their exchange orders
+        as ``ORDER_RECONCILIATION`` every cycle, and once they finally fill their
+        DB row stays ``OPEN`` forever and poisons the equity/P&L figures.
+
+        For each still-open row we decide, from the live exchange state, whether
+        the position is genuinely still on (adopt it back into management) or has
+        already closed while we were down (record a clean exit so the books and
+        the dashboard match reality).
+        """
+        if not open_rows:
+            return
+        try:
+            remote_orders = await self.client.get_open_orders()
+        except Exception as exc:
+            logger.warning(f"Adoption: could not read open orders; falling back to balances only: {exc}")
+            remote_orders = []
+        protected = {order.get("symbol") for order in remote_orders if order.get("symbol")}
+
+        adopted = 0
+        closed = 0
+        async with self.lock:
+            for row in open_rows:
+                symbol = row.get("symbol")
+                if not symbol or symbol in self.open_trades:
+                    continue
+                try:
+                    if await self._adopt_one(symbol, row, symbol in protected):
+                        adopted += 1
+                    else:
+                        closed += 1
+                except Exception as exc:
+                    logger.warning(f"Adoption failed for {symbol}: {exc}")
+
+        if adopted:
+            self.start_monitoring()
+        if (adopted or closed):
+            logger.warning(f"Startup adoption: re-attached {adopted} position(s), closed {closed} stale record(s)")
+            if self.journal:
+                await self.journal.log_event(
+                    "STARTUP_ADOPTION",
+                    "INFO",
+                    f"Adopted {adopted} open position(s); closed {closed} stale record(s) on startup",
+                    {"adopted": adopted, "closed": closed},
+                )
+
+    async def _adopt_one(self, symbol: str, row: dict[str, Any], has_resting_orders: bool) -> bool:
+        """Adopt a single DB-open trade, or close it if the exchange is flat.
+
+        Returns True when the position was re-attached, False when the record
+        was stale and has been closed out.
+        """
+        entry = _decimal(row.get("entry_price"), Decimal("0"))
+        sl = _decimal(row.get("sl_price"), Decimal("0"))
+        quantity = _decimal(row.get("quantity"), Decimal("0"))
+        if entry <= 0 or quantity <= 0:
+            await self._close_stale_record(symbol, row, entry)
+            return False
+
+        # Is the position actually still live on the exchange? A resting order is
+        # the strongest signal (spot OCO / futures closePosition bracket). On spot
+        # we also treat a real free base-asset balance as "held", which covers a
+        # position whose protection was cancelled or filled on one leg only.
+        held = has_resting_orders
+        if not held and not self.client.is_futures:
+            try:
+                free = await self.client.get_asset_free(_base_asset(symbol))
+            except Exception:
+                free = Decimal("0")
+            filters = await self.client.get_symbol_filters(symbol)
+            min_qty = filters.min_qty if filters else Decimal("0")
+            if free > 0 and (min_qty <= 0 or free >= min_qty):
+                held = True
+
+        if not held:
+            await self._close_stale_record(symbol, row, entry)
+            return False
+
+        direction = row.get("direction") or "LONG"
+        tp1 = _decimal(row.get("tp1_price"), Decimal("0"))
+        tp2 = _decimal(row.get("tp2_price"), Decimal("0")) if row.get("tp2_price") is not None else None
+        # final_target is not persisted; the runner's exit is the deepest known
+        # target, mirroring _protective_target's ordering.
+        target = next((lvl for lvl in (tp2, tp1) if lvl and lvl > 0), Decimal("0"))
+        risk = abs(entry - sl)
+        opened_at = _as_datetime(row.get("entry_time"))
+
+        plan = TradePlan(
+            approved=True,
+            reason="adopted",
+            checklist=[],
+            symbol=symbol,
+            direction=direction,
+            quantity=quantity,
+            entry_price=entry,
+            sl_price=sl,
+            tp1_price=tp1,
+            tp2_price=tp2,
+            final_target_price=target,
+            initial_risk_per_unit=risk,
+            strategy_used=row.get("strategy_used"),
+            regime_at_entry=row.get("regime_at_entry"),
+        )
+
+        # Rebuild the risk-manager position with the *original* open time so the
+        # time-stop measures real age, not seconds since the restart.
+        self.risk_manager.open_positions[symbol] = OpenPosition(
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry,
+            quantity=quantity,
+            sl_price=sl,
+            opened_at=opened_at,
+            risk_pct=Decimal("0"),
+            initial_risk_per_unit=risk,
+            highest_price=entry,
+            lowest_price=entry,
+        )
+        self.open_trades[symbol] = ManagedTrade(
+            plan=plan,
+            entry_order_id=str(row.get("binance_order_id") or ""),
+            opened_at=opened_at,
+            remaining_quantity=quantity,
+            protective_stop=sl,
+            protective_target=target,
+        )
+
+        # If the exchange isn't already protecting it, put a stop/target back on.
+        if not has_resting_orders and sl > 0 and target > 0:
+            try:
+                result = await self._place_protection(plan, quantity, sl, target)
+                if not result.accepted:
+                    logger.warning(f"Adoption: protection re-place for {symbol} rejected ({result.reason})")
+            except Exception as exc:
+                logger.warning(f"Adoption: could not re-place protection for {symbol}: {exc}")
+
+        logger.warning(
+            f"Adopted open {symbol} {direction} qty={quantity} entry={entry} "
+            f"(exchange-protected={has_resting_orders})"
+        )
+        if self.journal:
+            await self.journal.log_event(
+                "POSITION_ADOPTED",
+                "INFO",
+                f"Re-attached to open {symbol} {direction} from the database after a restart",
+                {"symbol": symbol, "entry": str(entry), "qty": str(quantity), "protected": has_resting_orders},
+            )
+        return True
+
+    async def _close_stale_record(self, symbol: str, row: dict[str, Any], entry: Decimal) -> None:
+        """Record a clean exit for a DB-open trade the exchange no longer holds."""
+        price = await self._latest_price(symbol)
+        if price <= 0:
+            price = entry
+        sl = _decimal(row.get("sl_price"), Decimal("0"))
+        quantity = _decimal(row.get("quantity"), Decimal("0"))
+        plan = TradePlan(
+            approved=False,
+            reason="stale",
+            checklist=[],
+            symbol=symbol,
+            direction=row.get("direction") or "LONG",
+            quantity=quantity,
+            entry_price=entry,
+            sl_price=sl,
+            initial_risk_per_unit=abs(entry - sl),
+        )
+        reason = self._infer_exit_reason(plan, price) if price > 0 else "MANUAL"
+        if self.journal:
+            await self.journal.log_trade_exit(symbol, price, reason)
+            await self.journal.log_event(
+                "ADOPT_STALE_CLOSE",
+                "WARNING",
+                f"{symbol} was OPEN in the DB but nothing is held on the exchange; recorded exit as {reason}",
+                {"symbol": symbol, "approx_exit": str(price), "reason": reason},
+            )
+        if quantity > 0 and entry > 0 and price > 0:
+            pnl = self._pnl(plan, price, quantity)
+            r_multiple = self._r_multiple(plan, price)
+            self.risk_manager.register_closed_trade(
+                symbol, pnl, r_multiple, remove_position=True, bar_seconds=_bar_seconds()
+            )
+        logger.warning(f"Adoption: {symbol} had no live position/orders; closed stale DB record as {reason}")
+
 
 def _protective_target(plan: TradePlan) -> Decimal:
     """The price the exchange-side OCO aims at: the runner's exit, not TP1."""
@@ -725,6 +984,19 @@ def _float(value: Any) -> float:
         return float(value)
     except Exception:
         return 0.0
+
+
+def _as_datetime(value: Any) -> datetime:
+    """Coerce a DB entry_time (usually already tz-aware) into a datetime."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+        except ValueError:
+            pass
+    return datetime.now(UTC)
 
 
 def _fmt(value: Decimal) -> str:
