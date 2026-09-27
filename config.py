@@ -86,6 +86,7 @@ class Settings:
     use_testnet: bool = field(default_factory=lambda: _bool("USE_TESTNET", True))
     live_trading_reviewed: bool = field(default_factory=lambda: _bool("LIVE_TRADING_REVIEWED", False))
     testnet_trade_count: int = field(default_factory=lambda: _int("TESTNET_TRADE_COUNT", 0))
+    min_live_trades: int = field(default_factory=lambda: _int("MIN_LIVE_TRADES", 60))
 
     database_url: str = field(default_factory=_database_url)
 
@@ -100,9 +101,155 @@ class Settings:
     max_daily_loss_pct: float = field(default_factory=lambda: _float("MAX_DAILY_LOSS_PCT", 4.0))
     max_weekly_loss_pct: float = field(default_factory=lambda: _float("MAX_WEEKLY_LOSS_PCT", 8.0))
     max_concurrent_trades: int = field(default_factory=lambda: _int("MAX_CONCURRENT_TRADES", 3))
-    confidence_threshold: float = field(default_factory=lambda: _float("CONFIDENCE_THRESHOLD", 0.70))
+    confidence_threshold: float = field(default_factory=lambda: _float("CONFIDENCE_THRESHOLD", 0.45))
     max_portfolio_risk_pct: float = field(default_factory=lambda: _float("MAX_PORTFOLIO_RISK_PCT", 3.0))
+    max_position_pct: float = field(default_factory=lambda: _float("MAX_POSITION_PCT", 5.0))
     drawdown_circuit_breaker_pct: float = field(default_factory=lambda: _float("DRAWDOWN_CIRCUIT_BREAKER_PCT", 10.0))
+    # Once tripped, the breaker used to latch forever with no code path that
+    # cleared it, so a single bad reading stopped trading until someone noticed
+    # and restarted the process. It now re-arms when equity recovers to within
+    # this percentage of the peak.
+    circuit_breaker_reset_pct: float = field(default_factory=lambda: _float("CIRCUIT_BREAKER_RESET_PCT", 5.0))
+
+    # --- venue -------------------------------------------------------------
+    # "spot" or "futures". On spot there is nothing to sell, so SHORT setups are
+    # rejected by the gate instead of being sent to Binance to be refused.
+    # Futures (USDT-M perpetuals) can go both ways, with leverage.
+    market_type: str = field(default_factory=lambda: os.getenv("MARKET_TYPE", "spot").strip().lower())
+    taker_fee_rate: float = field(default_factory=lambda: _float("TAKER_FEE_RATE", 0.001))
+    # Strategies (one per market regime) whose historical expectancy is negative
+    # are skipped entirely -- the bot only takes its proven-profitable setups.
+    # SHORT_MOMENTUM_TREND (PF 0.26) and BB_RSI_MEAN_REVERSION (0 wins) were the
+    # losers; comma-separated, case-insensitive. Set DISABLED_STRATEGIES="" to
+    # re-enable everything.
+    disabled_strategies: frozenset[str] = field(
+        default_factory=lambda: frozenset(
+            s.strip().upper()
+            for s in os.getenv(
+                "DISABLED_STRATEGIES", "SHORT_MOMENTUM_TREND,BB_RSI_MEAN_REVERSION"
+            ).split(",")
+            if s.strip()
+        )
+    )
+
+    # Futures testnet uses a SEPARATE key pair from spot testnet (issued at
+    # testnet.binancefuture.com, not testnet.binance.vision). Fall back to the
+    # spot key only so a misconfiguration fails at the API with a clear auth
+    # error rather than crashing at startup.
+    binance_futures_api_key: str = field(
+        default_factory=lambda: os.getenv("BINANCE_FUTURES_API_KEY", "") or os.getenv("BINANCE_API_KEY", "")
+    )
+    binance_futures_secret: str = field(
+        default_factory=lambda: os.getenv("BINANCE_FUTURES_SECRET", "") or os.getenv("BINANCE_SECRET", "")
+    )
+    futures_leverage: int = field(default_factory=lambda: _int("FUTURES_LEVERAGE", 3))
+    # ISOLATED keeps each position's risk walled off from the rest of the
+    # wallet; CROSSED shares margin. ISOLATED is the safer default.
+    futures_margin_type: str = field(default_factory=lambda: os.getenv("FUTURES_MARGIN_TYPE", "ISOLATED").strip().upper())
+
+    # --- signal quality ----------------------------------------------------
+    lstm_min_margin: float = field(default_factory=lambda: _float("LSTM_MIN_MARGIN", 0.15))
+    min_model_quality: float = field(default_factory=lambda: _float("MIN_MODEL_QUALITY", 0.40))
+    min_confluence_score: float = field(default_factory=lambda: _float("MIN_CONFLUENCE_SCORE", 60.0))
+    min_indicator_agreement: int = field(default_factory=lambda: _int("MIN_INDICATOR_AGREEMENT", 4))
+    min_conviction: float = field(default_factory=lambda: _float("MIN_CONVICTION", 0.20))
+    rl_veto_confidence: float = field(default_factory=lambda: _float("RL_VETO_CONFIDENCE", 0.55))
+
+    # --- position sizing ---------------------------------------------------
+    # Risk scales between these two bounds with conviction, instead of every
+    # trade betting the same fraction regardless of how good the setup is.
+    risk_min_pct: float = field(default_factory=lambda: _float("RISK_MIN_PCT", 0.25))
+    risk_max_pct: float = field(default_factory=lambda: _float("RISK_MAX_PCT", 1.25))
+    risk_curve_gamma: float = field(default_factory=lambda: _float("RISK_CURVE_GAMMA", 1.5))
+
+    # --- entries -----------------------------------------------------------
+    primary_timeframe: str = field(default_factory=lambda: os.getenv("PRIMARY_TIMEFRAME", "1h").strip().lower())
+    entry_on_closed_candle: bool = field(default_factory=lambda: _bool("ENTRY_ON_CLOSED_CANDLE", True))
+    loss_cooldown_bars: int = field(default_factory=lambda: _int("LOSS_COOLDOWN_BARS", 2))
+
+    # --- exits -------------------------------------------------------------
+    stop_atr_multiple: float = field(default_factory=lambda: _float("STOP_ATR_MULTIPLE", 1.5))
+    # Minimum stop distance as a percent of entry price. Floors the ATR/structural
+    # stop so a quiet, low-volatility market can't produce a hair-thin stop that
+    # gets noise-hit and makes the dollar risk (and trade size) trivially small.
+    stop_min_pct: float = field(default_factory=lambda: _float("STOP_MIN_PCT", 0.0))
+    # How far ahead the training labels look. Together with stop_atr_multiple
+    # this makes a label mean exactly what the trade does: "did price reach +1R
+    # before -1R within this many bars".
+    label_horizon: int = field(default_factory=lambda: _int("LABEL_HORIZON", 12))
+    tp1_r_multiple: float = field(default_factory=lambda: _float("TP1_R_MULTIPLE", 1.0))
+    tp2_r_multiple: float = field(default_factory=lambda: _float("TP2_R_MULTIPLE", 2.0))
+    final_target_r_multiple: float = field(default_factory=lambda: _float("FINAL_TARGET_R_MULTIPLE", 4.0))
+    # Reject any setup whose take-profit target (after the structural cap) offers
+    # less than this reward:risk. Raising it takes fewer but higher-quality trades.
+    min_reward_risk: float = field(default_factory=lambda: _float("MIN_REWARD_RISK", 2.0))
+    scale_out_tp1_fraction: float = field(default_factory=lambda: _float("SCALE_OUT_TP1_FRACTION", 0.40))
+    scale_out_tp2_fraction: float = field(default_factory=lambda: _float("SCALE_OUT_TP2_FRACTION", 0.30))
+    # Profit lock: once a trade has been this far in front, its stop is moved to
+    # entry plus costs and never moves back. This is what stops a winner from
+    # completing the round trip into a loss.
+    profit_lock_arm_r: float = field(default_factory=lambda: _float("PROFIT_LOCK_ARM_R", 0.25))
+    profit_lock_give_back: float = field(default_factory=lambda: _float("PROFIT_LOCK_GIVE_BACK", 0.50))
+    trail_arm_r: float = field(default_factory=lambda: _float("TRAIL_ARM_R", 1.0))
+    trail_atr_multiple: float = field(default_factory=lambda: _float("TRAIL_ATR_MULTIPLE", 2.5))
+    reversal_exit_enabled: bool = field(default_factory=lambda: _bool("REVERSAL_EXIT_ENABLED", True))
+    reversal_exit_min_r: float = field(default_factory=lambda: _float("REVERSAL_EXIT_MIN_R", 0.15))
+    time_stop_hours: float = field(default_factory=lambda: _float("TIME_STOP_HOURS", 8.0))
+
+    # Peak-profit guard: once a trade's profit has reached PEAK_GUARD_ARM_R (in
+    # R), track its high-water mark. If it then gives back more than
+    # PEAK_GUARD_GIVEBACK_PCT of that peak profit, close immediately at market.
+    # This is the "don't let a winner turn back into a loss" rule -- deliberately
+    # tight/sensitive. Raise the give-back to let winners breathe more; lower it
+    # to bank profit sooner.
+    # PURE TP/SL MODE: when true, a trade can ONLY end at its fixed stop-loss or
+    # its take-profit target. Every event-based exit is switched off -- no peak
+    # guard, no breakeven, no profit-floor, no trailing, no reversal, no time-stop,
+    # no drawdown circuit breaker, no partial scale-outs. The catastrophic -MAX_LOSS_R
+    # backstop stays (it IS a stop-loss). This is the "let winners run to TP, cut
+    # losers at SL" configuration.
+    pure_tp_sl: bool = field(default_factory=lambda: _bool("PURE_TP_SL", False))
+    peak_guard_enabled: bool = field(default_factory=lambda: _bool("PEAK_GUARD_ENABLED", True))
+    peak_guard_arm_r: float = field(default_factory=lambda: _float("PEAK_GUARD_ARM_R", 0.5))
+    peak_guard_giveback_pct: float = field(default_factory=lambda: _float("PEAK_GUARD_GIVEBACK_PCT", 5.0))
+    # Profit floor: once a trade has proved itself by reaching PROFIT_FLOOR_ARM_R
+    # in front, it may never return to a loss. If it drifts back down to the small
+    # locked PROFIT_FLOOR_R gain, bank it at market. This is the loss-side half of
+    # fixing the inverted payoff: trades that go green then reverse (which used to
+    # ride all the way to a full -1R) become small wins instead -- without capping
+    # runners, since the peak guard (checked first) still owns the high side.
+    profit_floor_enabled: bool = field(default_factory=lambda: _bool("PROFIT_FLOOR_ENABLED", False))
+    profit_floor_arm_r: float = field(default_factory=lambda: _float("PROFIT_FLOOR_ARM_R", 0.3))
+    profit_floor_r: float = field(default_factory=lambda: _float("PROFIT_FLOOR_R", 0.05))
+    # Breakeven-lock: once a trade has ever cleared BREAKEVEN_ARM_R of profit
+    # (net of round-trip fees) its stop is pulled to breakeven, so a winner can
+    # no longer come back to a loss. Only trades that never cleared it can lose.
+    breakeven_enabled: bool = field(default_factory=lambda: _bool("BREAKEVEN_ENABLED", True))
+    breakeven_arm_r: float = field(default_factory=lambda: _float("BREAKEVEN_ARM_R", 0.2))
+    # Hard catastrophic per-trade loss cap (in R). The monitor force-closes any
+    # trade at market once it is this far underwater, so a blown-through stop or a
+    # held loser can never become a multi-R disaster.
+    max_loss_r: float = field(default_factory=lambda: _float("MAX_LOSS_R", 1.5))
+    # How often the position monitor re-checks every open trade. Lower = the
+    # peak guard and stops react faster (at the cost of more price polls).
+    monitor_interval_seconds: float = field(default_factory=lambda: _float("MONITOR_INTERVAL_SECONDS", 4.0))
+    # How often the manual-stop request file is polled. A dedicated fast loop
+    # so the Stop button acts within a second or two, not on the 30s trade cycle.
+    close_poll_seconds: float = field(default_factory=lambda: _float("CLOSE_POLL_SECONDS", 1.0))
+
+    # --- training / learning ----------------------------------------------
+    # Testnet keeps only ~1100 hourly candles and prices them on its own
+    # matching engine. Historical training therefore reads mainnet's public
+    # kline endpoint (no key required) while orders still route to whichever
+    # venue USE_TESTNET selects.
+    training_data_source: str = field(
+        default_factory=lambda: os.getenv("TRAINING_DATA_SOURCE", "mainnet").strip().lower()
+    )
+    training_days: int = field(default_factory=lambda: _int("TRAINING_DAYS", 730))
+    training_interval: str = field(default_factory=lambda: os.getenv("TRAINING_INTERVAL", "1h").strip().lower())
+    learning_interval_minutes: int = field(default_factory=lambda: _int("LEARNING_INTERVAL_MINUTES", 360))
+    min_retrain_rows: int = field(default_factory=lambda: _int("MIN_RETRAIN_ROWS", 1500))
+    min_rl_update_rows: int = field(default_factory=lambda: _int("MIN_RL_UPDATE_ROWS", 500))
 
     cryptocompare_api_key: str = field(default_factory=lambda: os.getenv("CRYPTOCOMPARE_API_KEY", ""))
     economic_calendar_api_url: str = field(default_factory=lambda: os.getenv("ECONOMIC_CALENDAR_API_URL", ""))
@@ -116,19 +263,75 @@ class Settings:
     trading_state_path: Path = RUNTIME_DIR / "trading_state.json"
 
     @property
+    def completed_trade_count(self) -> int:
+        """Real number of completed trades, refreshed by the engine each cycle
+        (manual closes included). Falls back to the static TESTNET_TRADE_COUNT env
+        if the readiness file is missing."""
+        try:
+            import json as _json
+            data = _json.loads((self.runtime_dir / "trade_readiness.json").read_text(encoding="utf-8"))
+            return int(data.get("completed", 0))
+        except Exception:
+            return self.testnet_trade_count
+
+    @property
+    def mode(self) -> str:
+        """Demo = testnet paper money; Live = real account. Drives trade tagging
+        and which slice of data the dashboard shows."""
+        return "demo" if self.use_testnet else "live"
+
+    @property
+    def is_live_mode(self) -> bool:
+        return not self.use_testnet
+
+    @property
+    def futures_keys_configured(self) -> bool:
+        return bool(self.binance_futures_api_key and self.binance_futures_secret)
+
+    @property
     def live_trading_allowed(self) -> bool:
-        return self.use_testnet or (self.live_trading_reviewed and self.testnet_trade_count >= 100)
+        return self.use_testnet or (self.live_trading_reviewed and self.completed_trade_count >= self.min_live_trades)
 
     def assert_live_trading_allowed(self) -> None:
         if not self.live_trading_allowed:
             raise RuntimeError(
-                "Live trading is locked. Run at least 100 testnet trades and set "
-                "LIVE_TRADING_REVIEWED=true before USE_TESTNET=false."
+                f"Live trading is locked. Run at least {self.min_live_trades} testnet trades "
+                f"(you have {self.completed_trade_count}) and set LIVE_TRADING_REVIEWED=true "
+                "before USE_TESTNET=false."
             )
+
+    @property
+    def is_futures(self) -> bool:
+        return self.market_type == "futures"
+
+    @property
+    def shorting_available(self) -> bool:
+        return self.market_type == "futures"
+
+    @property
+    def active_api_key(self) -> str:
+        return self.binance_futures_api_key if self.is_futures else self.binance_api_key
+
+    @property
+    def active_api_secret(self) -> str:
+        return self.binance_futures_secret if self.is_futures else self.binance_secret
+
+    @property
+    def timeframe_preference(self) -> tuple[str, ...]:
+        """Analysis timeframes in priority order, primary first."""
+        rest = tuple(tf for tf in ("1h", "15m", "4h", "5m", "1m", "1d") if tf != self.primary_timeframe)
+        return (self.primary_timeframe, *rest)
 
     @property
     def binance_spot_base_url(self) -> str:
         return "https://testnet.binance.vision" if self.use_testnet else "https://api.binance.com"
+
+    @property
+    def training_data_base_url(self) -> str:
+        """Where historical klines come from, independent of where orders go."""
+        if self.training_data_source == "venue":
+            return self.binance_spot_base_url
+        return "https://api.binance.com"
 
     @property
     def binance_futures_base_url(self) -> str:

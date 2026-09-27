@@ -148,17 +148,28 @@ class MarketDataPipeline:
             return None
 
     async def _fetch_btc_dominance(self) -> float | None:
-        params = {"fsym": "BTC", "tsyms": "USD"}
-        if self.settings.cryptocompare_api_key:
-            params["api_key"] = self.settings.cryptocompare_api_key
-        raw = await self._fetch_json("https://min-api.cryptocompare.com/data/top/mktcapfull", {"limit": 20, "tsym": "USD"})
+        # CoinGecko's public /global endpoint needs no API key and returns BTC
+        # market-cap dominance directly -- replaces the cryptocompare endpoint that
+        # required a (now-unauthorized) key and was 401'ing every cycle.
+        raw = await self._fetch_json("https://api.coingecko.com/api/v3/global")
         try:
-            entries = raw["Data"]  # type: ignore[index]
-            total = sum(float(item["RAW"]["USD"]["MKTCAP"]) for item in entries if "RAW" in item)
-            btc = next(float(item["RAW"]["USD"]["MKTCAP"]) for item in entries if item["CoinInfo"]["Name"] == "BTC")
-            return (btc / total) * 100 if total else None
+            return float(raw["data"]["market_cap_percentage"]["btc"])  # type: ignore[index]
         except Exception:
-            return None
+            pass
+        # Fallback to cryptocompare only if a key is actually configured.
+        if self.settings.cryptocompare_api_key:
+            raw = await self._fetch_json(
+                "https://min-api.cryptocompare.com/data/top/mktcapfull",
+                {"limit": 20, "tsym": "USD", "api_key": self.settings.cryptocompare_api_key},
+            )
+            try:
+                entries = raw["Data"]  # type: ignore[index]
+                total = sum(float(item["RAW"]["USD"]["MKTCAP"]) for item in entries if "RAW" in item)
+                btc = next(float(item["RAW"]["USD"]["MKTCAP"]) for item in entries if item["CoinInfo"]["Name"] == "BTC")
+                return (btc / total) * 100 if total else None
+            except Exception:
+                return None
+        return None
 
     async def _liquidation_stream(self) -> None:
         url = f"{self.settings.binance_futures_ws_base_url}/!forceOrder@arr"

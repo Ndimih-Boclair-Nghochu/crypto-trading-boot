@@ -15,8 +15,16 @@ const mono = IBM_Plex_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Crypto Trading Desk",
-  description: "Live status, positions, and risk controls for the autonomous trading bot.",
+  title: "NBN Crypto Trading Desk",
+  description:
+    "NBN Crypto Trading Desk — live status, positions, performance and risk controls for the autonomous trading system.",
+  applicationName: "NBN Crypto Trading Desk",
+};
+
+export const viewport = {
+  width: "device-width",
+  initialScale: 1,
+  themeColor: "#05070d",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

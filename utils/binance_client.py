@@ -108,6 +108,11 @@ class ResilientBinanceClient:
         self.used_weight_1m = 0
         self.weight_limit_1m = 6000
         self._retry_after_seconds: int | None = None
+        self._futures_ready: set[str] = set()
+
+    @property
+    def is_futures(self) -> bool:
+        return self.settings.is_futures
 
     async def initialize(self) -> None:
         async with self._init_lock:
@@ -127,13 +132,20 @@ class ResilientBinanceClient:
                 # connectivity ourselves via the already-resilient ping()/
                 # update_exchange_info() below.
                 self.client = AsyncClient(
-                    api_key=self.settings.binance_api_key,
-                    api_secret=self.settings.binance_secret,
+                    api_key=self.settings.active_api_key,
+                    api_secret=self.settings.active_api_secret,
                     testnet=self.settings.use_testnet,
                 )
                 self.client.API_URL = self.settings.binance_spot_base_url + "/api"
+                # Futures REST lives at a different host; python-binance builds
+                # futures request URLs from FUTURES_URL, so point it explicitly
+                # even though testnet=True already sets a testnet default.
+                self.client.FUTURES_URL = self.settings.binance_futures_base_url + "/fapi"
                 try:
-                    server_time = await self.client.get_server_time()
+                    if self.is_futures:
+                        server_time = await self.client.futures_time()
+                    else:
+                        server_time = await self.client.get_server_time()
                     self.client.timestamp_offset = server_time["serverTime"] - int(time.time() * 1000)
                 except Exception as exc:
                     logger.warning(f"Could not sync Binance server time: {exc}")
@@ -145,6 +157,35 @@ class ResilientBinanceClient:
                     "once connectivity is restored."
                 )
             await self.update_exchange_info()
+            if self.is_futures:
+                await self._configure_futures_symbols()
+
+    async def _configure_futures_symbols(self) -> None:
+        """Set leverage and margin type once per symbol.
+
+        Both calls are idempotent-ish: Binance returns an error ("No need to
+        change margin type") when the value already matches, which is safe to
+        swallow. Done here so every position opens with the intended leverage
+        rather than the account default (often 20x).
+        """
+        if not self.client:
+            return
+        for symbol in self.settings.symbols:
+            try:
+                await self.client.futures_change_leverage(symbol=symbol, leverage=self.settings.futures_leverage)
+            except Exception as exc:
+                logger.warning(f"Could not set leverage for {symbol}: {self._format_api_exception(exc)}")
+            try:
+                await self.client.futures_change_margin_type(symbol=symbol, marginType=self.settings.futures_margin_type)
+            except Exception as exc:
+                # -4046 "No need to change margin type" is expected on re-runs.
+                if "4046" not in str(getattr(exc, "code", "")) and "No need" not in str(exc):
+                    logger.warning(f"Could not set margin type for {symbol}: {self._format_api_exception(exc)}")
+            self._futures_ready.add(symbol)
+        logger.info(
+            f"Futures configured for {sorted(self._futures_ready)} at {self.settings.futures_leverage}x "
+            f"{self.settings.futures_margin_type} margin"
+        )
 
     async def close(self) -> None:
         if self._health_task:
@@ -227,7 +268,10 @@ class ResilientBinanceClient:
                 and now - self.exchange_info_updated_at < self.exchange_info_ttl
             ):
                 return self.exchange_info
-            raw = await self._public_get(self.settings.binance_spot_base_url, "/api/v3/exchangeInfo")
+            if self.is_futures:
+                raw = await self._public_get(self.settings.binance_futures_base_url, "/fapi/v1/exchangeInfo")
+            else:
+                raw = await self._public_get(self.settings.binance_spot_base_url, "/api/v3/exchangeInfo")
             self.exchange_info = {item["symbol"]: item for item in raw.get("symbols", []) if "symbol" in item}
             self.exchange_info_updated_at = now
             for limit in raw.get("rateLimits", []):
@@ -246,10 +290,19 @@ class ResilientBinanceClient:
             return None
         by_type = {item.get("filterType"): item for item in symbol_info.get("filters", [])}
         price_filter = by_type.get("PRICE_FILTER", {})
+        # Futures uses MARKET_LOT_SIZE for market orders; fall back to LOT_SIZE.
         lot_filter = by_type.get("LOT_SIZE", {})
         min_notional_filter = by_type.get("MIN_NOTIONAL", {})
         notional_filter = by_type.get("NOTIONAL", {})
-        min_notional = min_notional_filter.get("minNotional") or notional_filter.get("minNotional") or "0"
+        # Spot MIN_NOTIONAL exposes "minNotional"; futures MIN_NOTIONAL exposes
+        # "notional". Accept either so one filter path serves both venues.
+        min_notional = (
+            min_notional_filter.get("minNotional")
+            or min_notional_filter.get("notional")
+            or notional_filter.get("minNotional")
+            or notional_filter.get("notional")
+            or "0"
+        )
         return SymbolFilters(
             symbol=symbol,
             tick_size=Decimal(str(price_filter.get("tickSize", "0"))),
@@ -262,8 +315,13 @@ class ResilientBinanceClient:
     @safe_api_call(False)
     async def ping(self) -> bool:
         if self.client:
-            await self.client.ping()
+            if self.is_futures:
+                await self.client.futures_ping()
+            else:
+                await self.client.ping()
             self._capture_client_response_headers()
+        elif self.is_futures:
+            await self._public_get(self.settings.binance_futures_base_url, "/fapi/v1/ping")
         else:
             await self._public_get(self.settings.binance_spot_base_url, "/api/v3/ping")
         self.connected = True
@@ -289,7 +347,19 @@ class ResilientBinanceClient:
 
     @safe_api_call(list)
     async def get_ohlcv(self, symbol: str, interval: str, limit: int = 500) -> list[Candle]:
-        if self.client:
+        # In futures mode read the perpetual's own klines so the indicators the
+        # bot trades on match the instrument it trades, not spot.
+        if self.is_futures:
+            if self.client:
+                raw = await self.client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+                self._capture_client_response_headers()
+            else:
+                raw = await self._public_get(
+                    self.settings.binance_futures_base_url,
+                    "/fapi/v1/klines",
+                    {"symbol": symbol, "interval": interval, "limit": limit},
+                )
+        elif self.client:
             raw = await self.client.get_klines(symbol=symbol, interval=interval, limit=limit)
             self._capture_client_response_headers()
         else:
@@ -325,8 +395,16 @@ class ResilientBinanceClient:
     ) -> list[Candle]:
         candles: list[Candle] = []
         cursor = start_time_ms
+        # Binance Spot Testnet runs its own matching engine and retains only a
+        # few weeks of klines, so training against it means fitting a model to
+        # roughly 1100 bars of prices that were never quoted anywhere real.
+        # Historical data therefore comes from mainnet's *public* kline
+        # endpoint, which needs no API key, while orders still route wherever
+        # USE_TESTNET points. Set TRAINING_DATA_SOURCE=venue to opt out.
+        from_mainnet = self.settings.training_data_source != "venue"
+        base_url = self.settings.training_data_base_url
         while cursor < end_time_ms:
-            if self.client:
+            if self.client and not from_mainnet:
                 raw = await self.client.get_klines(
                     symbol=symbol,
                     interval=interval,
@@ -337,7 +415,7 @@ class ResilientBinanceClient:
                 self._capture_client_response_headers()
             else:
                 raw = await self._public_get(
-                    self.settings.binance_spot_base_url,
+                    base_url,
                     "/api/v3/klines",
                     {"symbol": symbol, "interval": interval, "startTime": cursor, "endTime": end_time_ms, "limit": limit},
                 )
@@ -428,10 +506,52 @@ class ResilientBinanceClient:
             logger.warning("Private balance API requires python-binance client.")
             return Decimal("0")
         await self._throttle_if_needed()
+        if self.is_futures:
+            # availableBalance is the free margin usable to open new positions.
+            balances = await self.client.futures_account_balance()
+            self._capture_client_response_headers()
+            for balance in balances:
+                if balance.get("asset") == "USDT":
+                    return Decimal(str(balance.get("availableBalance", balance.get("balance", "0"))))
+            return Decimal("0")
         account = await self.client.get_account()
         self._capture_client_response_headers()
         for balance in account.get("balances", []):
             if balance.get("asset") == "USDT":
+                return Decimal(str(balance.get("free", "0")))
+        return Decimal("0")
+
+    @safe_api_call(lambda: (Decimal("0"), Decimal("0")))
+    async def get_futures_equity(self) -> tuple[Decimal, Decimal]:
+        """(marginBalance, unrealizedPnl) for the USDT-M wallet.
+
+        marginBalance = wallet balance + unrealized PnL, which is the correct
+        'total equity' for a futures account -- unlike spot, an open position is
+        margin plus floating PnL, not a holding of the base asset.
+        """
+        if not self.client:
+            return Decimal("0"), Decimal("0")
+        await self._throttle_if_needed()
+        account = await self.client.futures_account()
+        self._capture_client_response_headers()
+        margin_balance = Decimal(str(account.get("totalMarginBalance", "0")))
+        unrealized = Decimal(str(account.get("totalUnrealizedProfit", "0")))
+        return margin_balance, unrealized
+
+    @safe_api_call(lambda: Decimal("0"))
+    async def get_asset_free(self, asset: str) -> Decimal:
+        """Free balance of an arbitrary asset.
+
+        Needed before any SELL: that side spends the base asset, so checking the
+        USDT balance says nothing about whether the order can fill.
+        """
+        if not self.client:
+            return Decimal("0")
+        await self._throttle_if_needed()
+        account = await self.client.get_account()
+        self._capture_client_response_headers()
+        for balance in account.get("balances", []):
+            if balance.get("asset") == asset:
                 return Decimal(str(balance.get("free", "0")))
         return Decimal("0")
 
@@ -440,17 +560,77 @@ class ResilientBinanceClient:
         if not self.client:
             return OrderResult(False, reason="python-binance is required for authenticated order placement")
         await self._throttle_if_needed()
-        raw = await self.client.create_order(**kwargs)
+        if self.is_futures:
+            raw = await self.client.futures_create_order(**kwargs)
+        else:
+            raw = await self.client.create_order(**kwargs)
         self._capture_client_response_headers()
         return OrderResult(True, str(raw.get("orderId")), str(raw.get("status", "NEW")), raw=raw)
+
+    @safe_api_call(lambda: OrderResult(False, reason="protective order failed"))
+    async def place_futures_protection(
+        self, symbol: str, close_side: str, stop_price: str, target_price: str
+    ) -> OrderResult:
+        """Two reduceOnly close orders that bracket a futures position.
+
+        USDT-M futures has no OCO. Instead a STOP_MARKET and a
+        TAKE_PROFIT_MARKET, both with closePosition=true, sit on the book and
+        whichever triggers first flattens the position; Binance then cancels the
+        sibling automatically because the position is gone. closePosition sizes
+        to the whole position, so it stays correct even as scale-outs shrink it.
+        """
+        if not self.client:
+            return OrderResult(False, reason="python-binance required")
+        await self._throttle_if_needed()
+        stop = await self.client.futures_create_order(
+            symbol=symbol,
+            side=close_side,
+            type="STOP_MARKET",
+            stopPrice=stop_price,
+            closePosition="true",
+            workingType="MARK_PRICE",
+        )
+        target = await self.client.futures_create_order(
+            symbol=symbol,
+            side=close_side,
+            type="TAKE_PROFIT_MARKET",
+            stopPrice=target_price,
+            closePosition="true",
+            workingType="MARK_PRICE",
+        )
+        self._capture_client_response_headers()
+        return OrderResult(
+            True,
+            f"{stop.get('orderId')}/{target.get('orderId')}",
+            "PROTECTED",
+            raw={"stop": stop, "target": target},
+        )
 
     @safe_api_call(False)
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         if not self.client:
             return False
         await self._throttle_if_needed()
-        await self.client.cancel_order(symbol=symbol, orderId=order_id)
+        if self.is_futures:
+            await self.client.futures_cancel_order(symbol=symbol, orderId=order_id)
+        else:
+            await self.client.cancel_order(symbol=symbol, orderId=order_id)
         self._capture_client_response_headers()
+        return True
+
+    @safe_api_call(False)
+    async def cancel_all_orders(self, symbol: str) -> bool:
+        """Cancel every resting order for a symbol in one call (futures)."""
+        if not self.client:
+            return False
+        await self._throttle_if_needed()
+        if self.is_futures:
+            await self.client.futures_cancel_all_open_orders(symbol=symbol)
+        else:
+            for order in await self.get_open_orders(symbol):
+                oid = order.get("orderId")
+                if oid is not None:
+                    await self.cancel_order(symbol, str(oid))
         return True
 
     @safe_api_call(None)
@@ -458,7 +638,10 @@ class ResilientBinanceClient:
         if not self.client:
             return None
         await self._throttle_if_needed()
-        result = await self.client.get_order(symbol=symbol, orderId=order_id)
+        if self.is_futures:
+            result = await self.client.futures_get_order(symbol=symbol, orderId=order_id)
+        else:
+            result = await self.client.get_order(symbol=symbol, orderId=order_id)
         self._capture_client_response_headers()
         return result
 
@@ -470,7 +653,11 @@ class ResilientBinanceClient:
         if hasattr(self.client, "create_order_list_oco"):
             raw = await self.client.create_order_list_oco(**kwargs)
         elif hasattr(self.client, "create_oco_order"):
-            raw = await self.client.create_oco_order(**_legacy_oco_kwargs(kwargs))
+            # python-binance >= 1.0.37 routes create_oco_order to the new
+            # POST /api/v3/orderList/oco endpoint, which requires aboveType and
+            # belowType. Translating to the legacy stopPrice form produced
+            # "APIError -1102: aboveType was not sent", so forward as-is.
+            raw = await self.client.create_oco_order(**kwargs)
         else:
             return OrderResult(False, reason="python-binance client does not expose an OCO helper")
         self._capture_client_response_headers()
@@ -482,12 +669,31 @@ class ResilientBinanceClient:
         if not self.client:
             return []
         await self._throttle_if_needed()
-        if symbol:
+        if self.is_futures:
+            result = await (
+                self.client.futures_get_open_orders(symbol=symbol)
+                if symbol
+                else self.client.futures_get_open_orders()
+            )
+        elif symbol:
             result = await self.client.get_open_orders(symbol=symbol)
         else:
             result = await self.client.get_open_orders()
         self._capture_client_response_headers()
         return result
+
+    @safe_api_call(lambda: Decimal("0"))
+    async def get_futures_position_amt(self, symbol: str) -> Decimal:
+        """Signed position size on the perpetual (+long / -short / 0 flat)."""
+        if not self.client:
+            return Decimal("0")
+        await self._throttle_if_needed()
+        info = await self.client.futures_position_information(symbol=symbol)
+        self._capture_client_response_headers()
+        for position in info:
+            if position.get("symbol") == symbol:
+                return Decimal(str(position.get("positionAmt", "0")))
+        return Decimal("0")
 
 
 def round_step_size(quantity: Decimal | float | str, step_size: Decimal | float | str) -> Decimal:

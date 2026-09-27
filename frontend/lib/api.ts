@@ -4,6 +4,7 @@ export type TradingState = {
   status: string;
   reason?: string | null;
   trading_enabled: boolean;
+  paused?: boolean;
   testnet: boolean;
   binance_connected?: boolean;
   updated_at?: string | null;
@@ -24,6 +25,12 @@ export type Trade = {
   outcome: string;
   entry_time: string;
   exit_time?: string | null;
+  current_price?: number | string | null;
+  market_value?: number | string | null;
+  unrealized_pnl?: number | string | null;
+  expected_tp_usd?: number | string | null;
+  expected_sl_usd?: number | string | null;
+  unrealized_pct?: number | string | null;
 };
 
 export type EquityPoint = {
@@ -68,7 +75,20 @@ export type Overview = {
   performance: PerformanceRow[];
   no_trade: NoTradeRow[];
   symbols: string[];
+  mode?: "demo" | "live" | string;
   db_connected?: boolean;
+};
+
+export type ModeInfo = {
+  mode: "demo" | "live" | string;
+  is_live: boolean;
+  market_type: string;
+  shorting_available: boolean;
+  futures_keys_configured: boolean;
+  live_trading_allowed: boolean;
+  live_trading_reviewed: boolean;
+  completed_trade_count: number;
+  min_live_trades: number;
 };
 
 export type RiskSettings = {
@@ -93,7 +113,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => request<TradingState>("/api/health"),
+  systemStop: () => request<{ ok: boolean; paused: boolean }>("/api/system/stop", { method: "POST" }),
+  systemResume: () => request<{ ok: boolean; paused: boolean }>("/api/system/resume", { method: "POST" }),
+  closePosition: (symbol: string) =>
+    request<{ ok: boolean; queued: string }>(`/api/positions/${symbol}/close`, { method: "POST" }),
   overview: () => request<Overview>("/api/overview"),
+  mode: () => request<ModeInfo>("/api/mode"),
+  goLive: (confirm: string) =>
+    request<{ ok: boolean; error?: string; note?: string }>("/api/system/go-live", {
+      method: "POST",
+      body: JSON.stringify({ confirm }),
+    }),
+  goDemo: () =>
+    request<{ ok: boolean; note?: string }>("/api/system/go-demo", { method: "POST" }),
   riskSettings: () => request<RiskSettings>("/api/risk-settings"),
   saveRiskSettings: (settings: RiskSettings) =>
     request<RiskSettings>("/api/risk-settings", {
