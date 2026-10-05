@@ -13,7 +13,7 @@ pandas>=2.2,<3.0
 python-binance>=1.0
 python-dotenv>=1.0
 requests>=2.31
-SQLAlchemy>=2.0
+SQLAlchemy>=2.0,<2.1
 stable-baselines3>=2.3
 ta-lib>=0.4.28
 uvicorn[standard]>=0.29
@@ -28,3 +28,4 @@ pytest-asyncio>=0.23
 # has no GPU) and almost certainly the actual cause of "PyTorch failed to
 # import" -- either an OOM during import on memory-constrained instances,
 # or a CUDA-init failure with no compatible driver present.
+greenlet>=3

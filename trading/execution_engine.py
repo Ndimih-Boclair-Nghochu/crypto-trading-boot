@@ -264,21 +264,22 @@ class ExecutionEngine:
         if quantity <= 0:
             return OrderResult(False, status="FILTER_REJECTED", reason="OCO quantity is zero")
 
+        # MARKET stop (STOP_LOSS), not STOP_LOSS_LIMIT: a stop-limit places a limit
+        # order at the stop price, which goes UNFILLED when price gaps straight
+        # through it in a fast move -- leaving the position unprotected until it is
+        # force-closed far below (the -8R disasters). A market stop fills on trigger
+        # at whatever the market is, bounding the loss to the stop (plus slippage).
         if plan.direction == "LONG":
             oco_kwargs = {
                 "aboveType": "LIMIT_MAKER",
                 "abovePrice": _fmt(target_price),
-                "belowType": "STOP_LOSS_LIMIT",
+                "belowType": "STOP_LOSS",
                 "belowStopPrice": _fmt(stop_price),
-                "belowPrice": _fmt(stop_price),
-                "belowTimeInForce": "GTC",
             }
         else:
             oco_kwargs = {
-                "aboveType": "STOP_LOSS_LIMIT",
+                "aboveType": "STOP_LOSS",
                 "aboveStopPrice": _fmt(stop_price),
-                "abovePrice": _fmt(stop_price),
-                "aboveTimeInForce": "GTC",
                 "belowType": "LIMIT_MAKER",
                 "belowPrice": _fmt(target_price),
             }
@@ -362,15 +363,21 @@ class ExecutionEngine:
             await self._finalise(symbol, managed, price, "SL")
             return
 
-        # PURE TP/SL MODE: the trade ends ONLY at its fixed stop-loss or its
-        # take-profit target -- no peak-guard, breakeven, profit-floor, trailing,
-        # reversal, time-stop or scale-outs. Winners run to TP; losers stop at SL.
+        # PURE TP/SL MODE: the trade ends ONLY at its fixed stop-loss or a
+        # take-profit level -- no peak-guard, breakeven, profit-floor, trailing,
+        # reversal or time-stop. Take-profit is a THREE-LAYER ladder: bank a
+        # portion at TP1 and TP2, the rest at the final target. So a winner that
+        # reaches TP1/TP2 but turns back before the final target still locks in
+        # that profit instead of sliding all the way back to the stop. The stop
+        # itself stays fixed at the original SL throughout (no trailing).
         if settings.pure_tp_sl:
             if self._stop_hit(direction, price, plan.sl_price):
                 await self._finalise(symbol, managed, price, "SL")
                 return
+            if await self._take_scale_outs(symbol, managed, price, risk):
+                return
             if self._target_hit(direction, price, managed.protective_target or plan.final_target_price):
-                await self._finalise(symbol, managed, price, "TP")
+                await self._finalise(symbol, managed, price, "TP_FINAL")
                 return
             return
 
@@ -519,10 +526,20 @@ class ExecutionEngine:
                 if self.journal:
                     await self.journal.log_trade_exit(symbol, price, label)
                 return True
+            # Pure TP/SL: after banking a layer, re-place protection for the
+            # reduced quantity but keep the stop FIXED at the original SL (no
+            # trailing). Otherwise trail the stop as before.
+            new_stop = (
+                plan.sl_price
+                if settings.pure_tp_sl
+                else (
+                    self.risk_manager.update_protective_stop(symbol, price, _decimal(self.market_context.get(symbol, {}).get("atr_14"), Decimal("0")))
+                    or managed.protective_stop
+                )
+            )
             await self._replace_protection(
                 managed,
-                self.risk_manager.update_protective_stop(symbol, price, _decimal(self.market_context.get(symbol, {}).get("atr_14"), Decimal("0")))
-                or managed.protective_stop,
+                new_stop,
                 managed.protective_target or plan.final_target_price,
             )
         return False

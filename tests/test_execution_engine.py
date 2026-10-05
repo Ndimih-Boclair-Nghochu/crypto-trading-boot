@@ -441,30 +441,51 @@ def test_execution_rounds_order_to_symbol_filters() -> None:
 
 
 def test_pure_tp_sl_ignores_events_exits_only_at_sl_or_tp(monkeypatch) -> None:
-    """PURE_TP_SL: no event exit fires. A winner that rolled back but is still
-    between SL (97) and TP (112) stays OPEN; it closes only at SL or the target."""
+    """PURE_TP_SL: no event exit (peak-guard/breakeven/etc.) fires. A rolled-over
+    winner sitting below the first TP and above the SL stays OPEN; it leaves only
+    at a TP layer or the SL."""
     monkeypatch.setattr("trading.execution_engine.settings", replace(_base_settings, pure_tp_sl=True))
 
-    # 1) rolled-over winner, price 105 -- peak-guard/scale-outs would have closed it,
-    #    but pure mode leaves it open.
+    # price 102 -- below TP1 (103), above SL (97), but peaked at +2.5R. Peak-guard
+    # would have banked it; pure mode must leave it fully open.
     fake = FakeClient()
-    fake.current_price = Decimal("105")
+    fake.current_price = Decimal("102")
     risk = RiskManager()
     tp = plan()
     risk.register_open_position(tp)
     engine = ExecutionEngine(fake, risk, FakeJournal())  # type: ignore[arg-type]
     m = ManagedTrade(tp, "e1", remaining_quantity=tp.quantity)
-    m.peak_r = Decimal("2.5")  # had been well in front
+    m.peak_r = Decimal("2.5")
     engine.open_trades["BTCUSDT"] = m
     engine.update_market_context("BTCUSDT", {"atr_14": 2})
     run(engine._monitor_once())
-    assert "BTCUSDT" in engine.open_trades  # nothing closed it
+    assert "BTCUSDT" in engine.open_trades
+    assert m.remaining_quantity == tp.quantity  # untouched -- no event exit, no TP yet
 
-    # 2) price hits the take-profit target -> closes as TP.
-    fake.current_price = Decimal("113")
+
+def test_pure_tp_sl_three_layer_take_profit(monkeypatch) -> None:
+    """PURE_TP_SL banks TP1 and TP2 partials then closes the runner at the final
+    target -- a three-layer take-profit. A winner that only reaches TP1/TP2 keeps
+    that profit instead of round-tripping to the stop."""
+    monkeypatch.setattr("trading.execution_engine.settings", replace(_base_settings, pure_tp_sl=True))
+    fake = FakeClient()
+    fake.current_price = Decimal("104")  # past TP1 (103), below TP2 (106)
+    risk = RiskManager()
+    tp = plan()
+    risk.register_open_position(tp)
+    journal = FakeJournal()
+    engine = ExecutionEngine(fake, risk, journal)  # type: ignore[arg-type]
+    m = ManagedTrade(tp, "e1", remaining_quantity=tp.quantity)
+    engine.open_trades["BTCUSDT"] = m
+    engine.update_market_context("BTCUSDT", {"atr_14": 2})
     run(engine._monitor_once())
+    assert "BTCUSDT" in engine.open_trades and m.remaining_quantity < tp.quantity  # TP1 banked, runner left
+    # push through to the final target; a few ticks let TP2 then the runner close
+    fake.current_price = Decimal("113")
+    for _ in range(3):
+        run(engine._monitor_once())
     assert "BTCUSDT" not in engine.open_trades
-    assert engine.risk_manager.closed_trades[-1].pnl_usd > 0
+    assert sum(p["pnl_usd"] for p in journal.partials) > 0  # layers banked in profit
 
 
 def test_pure_tp_sl_closes_at_stop_loss(monkeypatch) -> None:
